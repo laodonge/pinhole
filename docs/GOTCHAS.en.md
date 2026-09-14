@@ -320,7 +320,8 @@ sw.addEventListener("activate", (event) => {
 - But this SW **holds interception state** (`domains`), and the old copy actively breaks the pages it controls
 - So "waiting" turns into "**the site is wedged, and the user has no way out but to clear site data**"
 
-**How to diagnose this class of problem**: `F12 → Application → Service Workers` to see how many SWs there are and which one is controlling; if necessary **Unregister** or tick **Update on reload**. That is how we confirmed it this time.
+**How to diagnose this class of problem**: `F12 → Application → Service Workers` to see how many SWs there are and which one is controlling;
+if necessary **Unregister** or tick **Update on reload**. That is how we confirmed it this time.
 
 > **Lesson**: **for a Service Worker that holds state, the update semantics must be designed on the assumption that the state will conflict**; you cannot just apply the defaults for a stateless SW.
 
@@ -599,7 +600,9 @@ Look at it as two cases; the conclusion is clear either way:
 | **The target machine itself** | You can saturate its uplink ✅ — but then **you do not need EasyTier at all**; it is just an ordinary WebSocket tunnel |
 | **Any other node** | **That node's uplink bandwidth becomes the ceiling** ❌, and you also pay for that machine and its traffic |
 
-**So this path is either meaningless (entry point = target, no overlay network needed) or expensive (entry point ≠ target, you are paying for someone else's forwarding).** And that cost is exactly the relay bandwidth bill we worked out earlier — **after going in a full circle, we are back to "either pay, or it does not work".**
+**So this path is either meaningless (entry point = target, no overlay network needed) or expensive (entry point ≠ target,
+you are paying for someone else's forwarding).** And that cost is exactly the relay bandwidth bill we worked out earlier —
+**after going in a full circle, we are back to "either pay, or it does not work".**
 
 ### 4.6 Comparison: why pinhole can saturate the uplink
 
