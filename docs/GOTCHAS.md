@@ -380,6 +380,42 @@ async function tunnelClient(event: FetchEvent): Promise<Client | undefined> {
 > 一旦引入"某个 frame 持有能力、其他 frame 需要用它"的结构（iframe + 共享连接、worker + 主线程），
 > 就必须显式记录**能力持有者**，而不是依赖请求携带的发起方身份。
 
+#### 附：一个更干净的做法（来自 BTunnel）
+
+我们在 [BTunnel](https://github.com/BarronDEV/btunnel) 里看到另一种解法，**它从根上消除了这个问题**：
+页面创建一个 `MessageChannel`，把一端**转移**给 Service Worker，之后双向通信全走这条 port。
+
+```js
+// 页面侧：建通道，把 port2 转移给 SW
+const channel = new MessageChannel();
+navigator.serviceWorker.controller.postMessage(
+  { type: "attach", port: channel.port2 },
+  [channel.port2],                       // ← 转移，不是复制
+);
+
+// SW 侧：拿到就直接用，不需要知道"谁持有隧道"
+self.addEventListener("message", (event) => {
+  const { type, port } = event.data;
+  if (type === "attach" && port) tunnelPort = port;
+});
+// 之后所有请求都 tunnelPort.postMessage(...)
+```
+
+| | 客户端查找（本项目当前做法） | `MessagePort`（BTunnel 做法） |
+|---|---|---|
+| 需要记录持有者吗 | ✅ 需要（`ownerClientId` + 顶层 frame 兜底） | ❌ **不需要** |
+| 每次请求的成本 | 一次 `clients.get()` / `matchAll()` | 无查找 |
+| 多 frame 歧义 | 需要靠 `frameType === "top-level"` 推断 | 不存在 |
+| **SW 被回收后** | ✅ 仍然能找到（客户端还在） | ❌ port 失效，必须重新 attach |
+
+**这是个权衡，不是纯升级**：
+`MessagePort` 消除了歧义和查找，代价是把"SW 生命周期"变成了必须处理的状态；
+而 `clients` 查找虽然要记持有者，但**天然跨 SW 重启存活**。
+
+如果这个 SW 本来就需要在重启后重新配置（本项目就是——`domains` 也是模块状态，SW 一重启就没了），
+那么 re-attach 的成本是**搭在已有的重新配置流程上的，不额外增加复杂度**——这种情况下
+`MessagePort` 是更好的选择。
+
 ### 2.9 页面被后台冻结 → 隧道静默死亡，而 Worker 还在拦截
 
 | | |

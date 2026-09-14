@@ -78,6 +78,54 @@
 
 ---
 
+## Prior art：这个思路不是独创的
+
+**先说清楚：Service Worker 透明代理 + WebRTC DataChannel P2P 这个组合不是本项目提出的。** 我们不是第一个，大概也不会是最后一个。
+
+| 项目 | 语言 | 形态 | 状态（2026-09） |
+|---|---|---|---|
+| **[BTunnel](https://github.com/BarronDEV/btunnel)** | Go | **机制最接近**：Zero-Install Web Mode 用 Service Worker 代理 + WebRTC DataChannel，绕 CGNAT、不走云端中继 | 2026-07 创建，3 次提交跨度 0.8 小时，此后未更新，1 star |
+| **[web-p2p-tunnel](https://github.com/andrewmthomas87/web-p2p-tunnel)** | Go + JS | P2P HTTP tunnel directly to/from the browser, using WebRTC and a Service Worker | 38 star |
+| **[peerfetch](https://github.com/ambianic/peerfetch)** | JS + Python | 浏览器 ↔ 边缘设备直连，HTTP over WebRTC | 607 star |
+| **[HyperTunnelRTC](https://github.com/KirCute/HyperTunnelRTC)** | — | 浏览器透明 HTTP 反代，用预置 SDP 免信令 | 作者自述有安全取舍 |
+| **[p2claw](https://p2claw.com)** | — | 商业托管，同样给浏览器一个 P2P URL | 用自己的域名 |
+
+### 与 BTunnel 的逐项对比（最接近的一个）
+
+| | BTunnel | pinhole |
+|---|---|---|
+| Service Worker 透明代理 | ✅ | ✅ |
+| WebRTC DataChannel P2P | ✅ | ✅ |
+| 背压 + 16 KB 分块 | ✅ | ✅ |
+| Range / 206 | ✅ 透明转发（隐式支持） | ✅ 透明转发 + 9 项断言显式验证 |
+| **SW↔页面 的通道** | ✅ **`MessagePort` 直连**——页面把 port 转移给 SW，SW 不需要知道"谁持有隧道" | ⚠️ `postMessage` + 客户端查找（要记住持有者，见 [GOTCHAS §2.8](docs/GOTCHAS.md#28-请求来自哪个-frame--隧道在哪个-frame)） |
+| **信令** | ❌ **需要服务器**（官方 `handshake.btunnel.dpdns.org`，或自建 + Redis；CLI 可内嵌信令进程） | ✅ **可以完全不要**（公共 MQTT，主题 = `SHA-256(room:secret)` 前 32 位，每条 HMAC 签名） |
+| 会话凭据 | ✅ 一次性 token（`bt-...`，用后即废） | ⚠️ room + secret（可重复使用） |
+| ICE 配置 | ✅ 由信令下发（可集中配 TURN） | ⚠️ 写死在 `config.js` |
+| **TURN 兜底** | ✅ 带 coturn 配置 | ❌ 靠 IPv6，或如实承认打不通 |
+| **自定义域名** | ❌ 用它自己的域名 | ✅ 用你自己的子域名 |
+| 覆盖范围 | Docker 网络 / TCP / UDP / CLI↔CLI mesh / 实时 TUI | 只做 HTTP + 浏览器 |
+| 文档 | README + 配置指南 | **28 条踩坑记录**（每条「症状 → 原因 → 修法 → 怎么发现」）+ 实测数据 |
+| 活跃度 | 3 次提交跨度 0.8 小时，此后未更新，1 star | 真机跑通、有实测数字 |
+
+**从 BTunnel 可以学的四件事**（这些 pinhole 目前做得不如它）：
+
+1. **`MessagePort` 直连**——页面把 port 转移给 SW，SW 直接用它收发，**从根上消除"哪个 frame 持有隧道"这个问题**。代价是 SW 被回收后 port 失效，需要重新 attach。
+2. **CLI 内嵌信令进程**——`btunnel run` 自动在后台起信令，不需要用户单独开一个终端。
+3. **一次性 token**——用后即废，比可重复使用的共享密钥更安全（但需要服务端签发）。
+4. **ICE 配置由信令下发**——可以集中改 STUN/TURN，不用让每个用户改自己的配置文件。
+
+**所以诚实的定位是：**
+
+> pinhole **不是一个新机制**。它是在同一个机制上，把**信令做成零服务器**、把**域名所有权交还用户**，
+> 并且**把一路上踩到的 28 个坑逐条写下来**的一个实现。
+
+**要功能更全的话，BTunnel 的覆盖面更大**（Docker / TCP / UDP / TURN 兜底 / TUI），
+而且它在 **SW↔页面通道**这个细节上的设计比 pinhole 干净。
+**要弄懂这条路到底有哪些坑，那才是这份仓库存在的理由。**
+
+---
+
 ## 它是什么
 
 ```

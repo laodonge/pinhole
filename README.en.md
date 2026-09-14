@@ -84,6 +84,54 @@ The full reasoning is in **[docs/GOTCHAS.en.md § 6](docs/GOTCHAS.en.md)**.
 
 ---
 
+## Prior art: the idea is not ours
+
+**To be clear from the start: the combination of a Service Worker transparent proxy and a WebRTC DataChannel P2P tunnel is not this project's invention.** We are not the first, and probably not the last.
+
+| Project | Language | Shape | Status (2026-09) |
+|---|---|---|---|
+| **[BTunnel](https://github.com/BarronDEV/btunnel)** | Go | **Closest mechanism**: its "Zero-Install Web Mode" uses a Service Worker proxy plus a WebRTC DataChannel, bypassing CGNAT with no cloud relay | Created 2026-07, 3 commits spanning 0.8 h, untouched since, 1 star |
+| **[web-p2p-tunnel](https://github.com/andrewmthomas87/web-p2p-tunnel)** | Go + JS | "P2P HTTP tunnel directly to/from the browser, using WebRTC and a Service Worker" | 38 stars |
+| **[peerfetch](https://github.com/ambianic/peerfetch)** | JS + Python | Browser ↔ edge device, HTTP over WebRTC | 607 stars |
+| **[HyperTunnelRTC](https://github.com/KirCute/HyperTunnelRTC)** | — | Transparent browser HTTP reverse proxy, signalless (SDP pasted in) | Author documents security trade-offs |
+| **[p2claw](https://p2claw.com)** | — | Hosted commercial service; also hands a browser a P2P URL | Runs on their domain |
+
+### Line-by-line against BTunnel (the closest one)
+
+| | BTunnel | pinhole |
+|---|---|---|
+| Service Worker transparent proxy | ✅ | ✅ |
+| WebRTC DataChannel P2P | ✅ | ✅ |
+| Backpressure + 16 KB chunking | ✅ | ✅ |
+| Range / 206 | ✅ Transparent forwarding (implicit) | ✅ Transparent forwarding + 9 explicit assertions |
+| **Worker ↔ page channel** | ✅ **A transferred `MessagePort`** — the worker never has to work out who holds the tunnel | ⚠️ `postMessage` plus a client lookup (it has to remember the owner — see [GOTCHAS §2.8](docs/GOTCHAS.en.md)) |
+| **Signaling** | ❌ **Needs a server** (their `handshake.btunnel.dpdns.org`, or self-hosted with Redis; the CLI can embed the signaling process) | ✅ **Can need none at all** (public MQTT; topic = first 32 chars of `SHA-256(room:secret)`, every message HMAC-signed) |
+| Session credential | ✅ Single-use token (`bt-...`, consumed on join) | ⚠️ room + secret, reusable |
+| ICE configuration | ✅ Delivered by signaling (TURN can be configured centrally) | ⚠️ Hard-coded in `config.js` |
+| **TURN fallback** | ✅ Ships coturn config | ❌ Relies on IPv6, or admits it will not connect |
+| **Custom domain** | ❌ Uses their domain | ✅ Uses your own subdomain |
+| Scope | Docker networks / TCP / UDP / CLI↔CLI mesh / live TUI | HTTP + browser only |
+| Documentation | README + a configuration guide | **28 documented traps** ("symptom → cause → fix → how we found out") + measured numbers |
+| Activity | 3 commits over 0.8 h, untouched since, 1 star | Runs on real hardware, with measured numbers |
+
+**Four things worth learning from BTunnel** (places where it is ahead of pinhole):
+
+1. **A transferred `MessagePort`** — the page hands the worker one end of a channel, so the worker never has to determine which frame holds the tunnel. That removes the whole problem class at the root. The cost is that the port dies if the worker is recycled, so it must be re-attached.
+2. **An embedded signaling process** — `btunnel run` starts signaling in the background; the user does not need a second terminal.
+3. **Single-use tokens** — consumed on join, which is stronger than a reusable shared secret (but needs a server to issue them).
+4. **ICE configuration delivered over signaling** — STUN/TURN can be changed centrally instead of in every user's config file.
+
+**So the honest positioning is:**
+
+> pinhole **is not a new mechanism**. It is an implementation of the same mechanism with **serverless signaling**,
+> **domain ownership handed back to the user**, and **the 28 traps written down one by one**.
+
+**If you want a fuller tool, BTunnel covers more ground** (Docker / TCP / UDP / TURN fallback / TUI), and its
+design for the worker↔page channel is cleaner than pinhole's. **If you want to understand which traps this road
+actually has, that is the reason this repository exists.**
+
+---
+
 ## What it is
 
 ```
