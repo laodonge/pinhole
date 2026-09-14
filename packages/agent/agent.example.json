@@ -1,0 +1,7 @@
+{
+  "signal": "mqtts://broker.emqx.io:8883",
+  "room": "nas",
+  "secret": "REPLACE_WITH_YOUR_ACCESS_KEY",
+  "target": "127.0.0.1:5244",
+  "stun": "stun:stun.cloudflare.com:3478"
+}

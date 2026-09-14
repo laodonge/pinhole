@@ -1,0 +1,24 @@
+{
+  "name": "@pinhole/component",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/pinhole.js",
+  "module": "./dist/pinhole.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/pinhole.js"
+    }
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "test:mqtt": "esbuild test/mqtt-signaling.test.ts --bundle --platform=node --format=esm --target=node20 --outfile=dist-test/mqtt.mjs && node dist-test/mqtt.mjs"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11"
+  }
+}

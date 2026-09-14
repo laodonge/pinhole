@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>连接中…</title>
+    <link rel="icon" href="data:," />
+    <!--
+      config.js 由 public/ 原样复制，部署后可以直接改（不需要重新构建）。
+    -->
+    <script src="/config.js"></script>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: ui-sans-serif, system-ui, "Segoe UI", "PingFang SC",
+          "Microsoft YaHei", sans-serif;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #0b1020;
+      }
+      /*
+        必须放在最前面并加 !important：
+        `hidden` 属性由 UA 样式表实现为 `display: none`，而作者样式表里的
+        `#overlay { display: flex }` 会**覆盖**它 —— 于是 hidden 形同虚设，
+        遮罩永远不消失。这是一个很容易踩的坑。
+      */
+      [hidden] {
+        display: none !important;
+      }
+      #view {
+        position: fixed;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        border: 0;
+        background: #fff;
+      }
+      #overlay {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+        background: #0b1020;
+        color: #e2e8f0;
+        overflow: auto;
+      }
+      .card {
+        width: 100%;
+        max-width: 34rem;
+        text-align: center;
+      }
+      .ring {
+        width: 34px;
+        height: 34px;
+        margin: 0 auto 18px;
+        border-radius: 50%;
+        border: 3px solid #1e293b;
+        border-top-color: #38bdf8;
+        animation: spin 0.9s linear infinite;
+      }
+      .ring.stopped {
+        animation: none;
+        border-top-color: #f87171;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      #status {
+        font-size: 16px;
+        font-weight: 600;
+        margin-bottom: 10px;
+      }
+      #detail {
+        font-size: 13px;
+        line-height: 1.7;
+        opacity: 0.78;
+        white-space: pre-wrap;
+        word-break: break-word;
+        margin-bottom: 18px;
+      }
+
+      /*
+        诊断面板：显示在这台设备上实际生效的参数。
+        没有它，出问题时只能靠 F12 控制台 —— 手机上根本没有。
+      */
+      #diag {
+        margin: 0;
+        border: 1px solid #1e293b;
+        border-radius: 10px;
+        overflow: hidden;
+        font-size: 12.5px;
+        text-align: left;
+      }
+      #diag .row {
+        display: flex;
+        gap: 10px;
+        padding: 8px 12px;
+        border-bottom: 1px solid #16213a;
+      }
+      #diag .row:last-child {
+        border-bottom: 0;
+      }
+      #diag .k {
+        flex: 0 0 5.5rem;
+        opacity: 0.55;
+      }
+      #diag .v {
+        flex: 1;
+        word-break: break-all;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+      #diag .v.ok {
+        color: #4ade80;
+      }
+      #diag .v.warn {
+        color: #fbbf24;
+      }
+      #diag .v.bad {
+        color: #f87171;
+      }
+      code {
+        background: #1e293b;
+        border-radius: 4px;
+        padding: 1px 5px;
+        font-size: 12px;
+      }
+
+      /* 网络诊断：判断当前网络能否打洞。手机上没有控制台，所以必须画在页面上。 */
+      #diag-actions {
+        margin-top: 14px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        justify-content: center;
+        flex-wrap: wrap;
+      }
+      #run-diag {
+        background: #1e293b;
+        color: #e2e8f0;
+        border: 1px solid #334155;
+        border-radius: 8px;
+        padding: 8px 16px;
+        font: inherit;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      #run-diag:hover:not(:disabled) {
+        background: #273449;
+      }
+      #run-diag:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      #diag-hint {
+        font-size: 12.5px;
+        opacity: 0.55;
+      }
+      #diag-output {
+        margin: 14px 0 0;
+        padding: 14px;
+        border: 1px solid #1e293b;
+        border-radius: 10px;
+        background: #070d1a;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 12px;
+        line-height: 1.65;
+        text-align: left;
+        white-space: pre-wrap;
+        word-break: break-all;
+        max-height: 18rem;
+        overflow: auto;
+      }
+    </style>
+  </head>
+  <body>
+    <!--
+      外壳页面（shell）。它不展示服务内容，只负责两件事：
+        ① 建立并保持 P2P 连接（连接活在"页面"里，不在 Service Worker 里）
+        ② 把服务渲染在 iframe 中——iframe 的请求会被 SW 代理
+      顶层导航永远由 SW 返回这个外壳，所以连接不会被导航弄丢。
+    -->
+    <iframe id="view" title="服务" allow="clipboard-read; clipboard-write; fullscreen" hidden></iframe>
+
+    <div id="overlay">
+      <div class="card">
+        <div class="ring" id="ring"></div>
+        <div id="status">正在连接信令服务器…</div>
+        <div id="detail"></div>
+        <div id="diag"></div>
+        <div id="diag-actions">
+          <button id="run-diag" type="button">运行网络诊断</button>
+          <span id="diag-hint">判断当前网络能否打洞</span>
+        </div>
+        <pre id="diag-output" hidden></pre>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

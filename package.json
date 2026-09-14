@@ -1,0 +1,16 @@
+{
+  "name": "pinhole",
+  "version": "0.1.0",
+  "private": true,
+  "description": "WebRTC-based seamless P2P web access component",
+  "workspaces": [
+    "packages/component",
+    "packages/service-worker",
+    "packages/signaling",
+    "packages/bootstrap"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  }
+}

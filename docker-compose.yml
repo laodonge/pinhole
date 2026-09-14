@@ -1,0 +1,20 @@
+services:
+  signaling:
+    build:
+      context: ./packages/agent
+    command: ["-mode", "signal", "-listen", "0.0.0.0:8787"]
+    ports:
+      - "8787:8787"
+
+  backend:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+
+  agent:
+    build:
+      context: ./packages/agent
+    command: ["-signal", "ws://signaling:8787/ws", "-room", "demo", "-target", "backend:80"]
+    depends_on:
+      - signaling
+      - backend

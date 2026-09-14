@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="zh">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>pinhole-tunnel demo</title>
+  </head>
+  <body>
+    <pinhole-tunnel
+      signal="ws://localhost:8787/ws"
+      room="demo"
+      domain="nas.p2p"
+    ></pinhole-tunnel>
+
+    <h1>pinhole-tunnel demo</h1>
+    <button id="btn">fetch http://nas.p2p/</button>
+    <pre id="out">click the button</pre>
+
+    <script type="module">
+      import "./src/index.ts";
+
+      const tunnel = document.querySelector("pinhole-tunnel");
+      for (const ev of ["connected", "disconnected", "error"]) {
+        tunnel.addEventListener(ev, (e) => {
+          console.log("[pinhole-tunnel]", ev, e.detail);
+        });
+      }
+
+      document.getElementById("btn").addEventListener("click", async () => {
+        const out = document.getElementById("out");
+        out.textContent = "loading...";
+        try {
+          const res = await fetch("http://nas.p2p/");
+          out.textContent = `status=${res.status}\n${await res.text()}`;
+        } catch (e) {
+          out.textContent = "error: " + e;
+        }
+      });
+    </script>
+  </body>
+</html>

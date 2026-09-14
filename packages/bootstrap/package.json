@@ -1,0 +1,19 @@
+{
+  "name": "@pinhole/bootstrap",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Static bootstrap page: serve it from your own domain, and any hostname under it becomes a P2P entry into your server.",
+  "scripts": {
+    "build": "node scripts/copy-sw.mjs && vite build",
+    "dev": "node scripts/copy-sw.mjs && vite",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@pinhole/component": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11"
+  }
+}
