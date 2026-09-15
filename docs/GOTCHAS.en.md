@@ -573,6 +573,12 @@ setInterval(() => {
 }, 20_000);
 ```
 
+**This is not a problem specific to this project.** The closest thing out there, **[BTunnel](https://github.com/BarronDEV/btunnel)**, uses a **completely different worker↔page channel** (a transferred `MessagePort` rather than `postMessage`) and still **independently evolved the same recovery mechanism**: its `sw.js` also keeps the tunnel port in a module-scope variable, the page sends `PING_TUNNEL` on a timer, and the moment the worker notices the port is gone it broadcasts `REQUEST_TUNNEL_PORT` so the page re-attaches.
+
+> In other words: **changing the channel design does not let you dodge this one** — it follows from
+> "the worker gets recycled" itself, not from any particular channel implementation. That is exactly
+> why this trap deserves its own entry.
+
 > **Lesson**: **as long as you put state in a Service Worker's module scope, you must assume it can disappear at any moment.**
 >
 > A SW is not a long-lived process, but something that "gets woken by events and killed when idle".
