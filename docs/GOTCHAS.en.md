@@ -475,6 +475,62 @@ document.addEventListener("visibilitychange", () => {
 > Otherwise the failure shows up in the form of **"stuck"** rather than **"an error"** — and "stuck" is the hardest class of symptom to diagnose:
 > no exception, no log, no failing status code, just a request that never returns.
 
+### 2.10 Multiple tabs: one "current owner" cannot represent two tunnels
+
+| | |
+|---|---|
+| **Symptom** | Open two tabs on the same origin and both work; but **close the one you opened last and the other one breaks along with it** |
+| **Cause** | The SW stores only **one** "current owner" (one `ownerClientId`, or one `tunnelPort`). When the second tab registers it **overwrites** the first, so the requests of both tabs all go through the latter's tunnel |
+| **Fix** | Register **separately** per client, and route by where the request came from |
+
+**Neither design can dodge this bug**: in the `MessagePort` approach the SW also stores only one `tunnelPort`, and a later registration overwrites an earlier one just the same.
+**It is not a design-choice problem; it is the problem of "using one variable to represent multiple instances".**
+
+#### The hard part: how do you know which tab a request came from
+
+A request may come from the shell, or from the iframe inside it, and **`Client` does not expose the parent relationship** —
+there is no way to trace backwards from the iframe to its top-level frame.
+
+**But there is one moment when both ends are visible at the same time**:
+
+```
+iframe 导航时（shell 设置 view.src）：
+    event.clientId           = shell      ← 发起者，它持有隧道
+    event.resultingClientId  = 新 iframe   ← 即将创建，之后会自己发请求
+                ↓
+        就在这一刻记下映射：iframe → shell
+```
+
+After that, every request from the iframe has a `clientId` equal to that resulting id, and looking it up in the table gets you back to the shell ✅
+
+```js
+// 导航发生时记下归属，此时两端都看得到
+if (event.resultingClientId) {
+  const initiator = event.clientId || frameOwner.get(event.clientId) || "";
+  if (initiator && initiator !== event.resultingClientId) {
+    frameOwner.set(event.resultingClientId, initiator);
+  }
+}
+
+// 路由时优先用请求方自己的隧道 —— 这才是两个标签页互不干扰的关键
+const requester = event.clientId || event.resultingClientId || "";
+const owner = frameOwner.get(requester) ?? requester;
+for (const id of [owner, ...tunnels.keys()]) { /* 命中即用 */ }
+```
+
+#### Two details you have to handle
+
+| Detail | Handling |
+|---|---|
+| **Degradation** | The fallback drops back to "any tunnel serving that domain". Because `frameOwner` is lost along with the SW when it is recycled, and **an iframe that is already loaded will not navigate again**, the mapping cannot be rebuilt. At that point it degrades to the old shared behaviour, **rather than hanging** ✅ |
+| **Unregistration** | When the page disconnects it sends `domains: []`; at that point remove that client from `tunnels` ✅ Otherwise a dead entry is left behind and the fallback routes to a tab that has already closed |
+
+> **Lesson**: **"which one is currently active" and "which ones are active" are two different questions.**
+>
+> Whenever there are multiple instances of the same kind (tabs, connections, sessions, dialogues), you must **record them per instance**,
+> rather than maintaining a "current" pointer — **the latter fails silently the moment the second instance appears**,
+> and the symptom ("closing A breaks B") is a long way from the cause ("you only stored one variable").
+
 ---
 
 ## 3. Signalling
