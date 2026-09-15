@@ -2,6 +2,7 @@ import { MqttSignalingClient } from "./signaling-mqtt";
 import { SignalingClient, type SignalingChannel } from "./signaling";
 import { Tunnel } from "./tunnel";
 import { encodeRequest, splitResponse } from "./http";
+import { RawWebSocket } from "./ws";
 
 interface ProxyRequest {
   type: "proxy-request";
@@ -10,6 +11,24 @@ interface ProxyRequest {
   url: string;
   headers: Record<string, string>;
   body: ArrayBuffer;
+}
+
+/** Messages the injected shim sends over its port. */
+type ShimMessage =
+  | {
+      t: "open";
+      id: string;
+      url: string;
+      protocols: string[];
+      cookie: string;
+      origin: string;
+    }
+  | { t: "send"; id: string; data: string | ArrayBuffer }
+  | { t: "close"; id: string; code?: number; reason?: string };
+
+interface WsSession {
+  raw: RawWebSocket;
+  port: MessagePort;
 }
 
 /**
@@ -50,6 +69,7 @@ export class PinholeTunnelElement extends HTMLElement {
    */
   private passthroughPaths: string[] = [
     "/sw.js",
+    "/pinhole-shim.js",
     "/config.js",
     "/index.html",
     "/assets/",
@@ -61,15 +81,32 @@ export class PinholeTunnelElement extends HTMLElement {
   /** Re-asserts the worker registration. See REGISTRATION_HEARTBEAT_MS. */
   private heartbeat: ReturnType<typeof setInterval> | null = null;
 
+  /**
+   * The most recent `Cookie` header seen on proxied traffic, per hostname.
+   *
+   * The injected shim cannot read an `HttpOnly` cookie, and a real WebSocket
+   * handshake would have one sent automatically by the browser. It cannot here,
+   * because the handshake is ours — so we borrow the header off ordinary HTTP
+   * requests instead. In practice this always works out: a service authenticates
+   * the page load before its own scripts ever open a socket (1Panel even issues
+   * an HTTP pre-flight on the very same path), so by the time a websocket is
+   * attempted the cookie has already been seen.
+   */
+  private cookies = new Map<string, string>();
+  /** Live virtual websockets, keyed by the id the shim assigned. */
+  private wsSessions = new Map<string, WsSession>();
+
   connectedCallback(): void {
     document.addEventListener("visibilitychange", this.onVisibilityChange);
     navigator.serviceWorker.addEventListener("message", this.onSwMessage);
+    window.addEventListener("message", this.onWindowMessage);
     this.startSession();
   }
 
   disconnectedCallback(): void {
     document.removeEventListener("visibilitychange", this.onVisibilityChange);
     navigator.serviceWorker.removeEventListener("message", this.onSwMessage);
+    window.removeEventListener("message", this.onWindowMessage);
     this.stopSession();
   }
 
@@ -133,6 +170,8 @@ export class PinholeTunnelElement extends HTMLElement {
   private stopSession(): void {
     this.stopHeartbeat();
     void this.releaseWakeLock();
+    for (const session of this.wsSessions.values()) session.raw.close(1001, "tunnel closed");
+    this.wsSessions.clear();
     this.tunnel?.close();
     this.signalClient?.close();
     this.tunnel = null;
@@ -309,6 +348,17 @@ export class PinholeTunnelElement extends HTMLElement {
   private async handleProxyRequest(msg: ProxyRequest): Promise<void> {
     const { id, method, url, headers } = msg;
     const body = new Uint8Array(msg.body);
+
+    // Remember the cookie for later websocket handshakes — see `cookies`.
+    const cookie = headers["cookie"];
+    if (cookie) {
+      try {
+        this.cookies.set(new URL(url).hostname, cookie);
+      } catch {
+        // A malformed url just means no cookie is cached for it.
+      }
+    }
+
     try {
       const reqBytes = encodeRequest(method, url, headers, body);
       const stream = await this.tunnel!.request(reqBytes);
@@ -351,5 +401,137 @@ export class PinholeTunnelElement extends HTMLElement {
 
   private postToSw(data: unknown, transfer?: Transferable[]): void {
     navigator.serviceWorker.controller?.postMessage(data, transfer ?? []);
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // WebSocket
+  // ───────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Accept a port from an injected shim.
+   *
+   * The shim runs inside the proxied service's document (an iframe of this
+   * page) and cannot reach the data channel itself, so it posts us one end of a
+   * `MessageChannel` and multiplexes every socket it creates over it.
+   *
+   * The handshake is deliberately this thin: the shim decides *synchronously*
+   * which URLs to tunnel (its constructor has to return immediately), and after
+   * that we only ever exchange messages. No object is shared, so a shim from a
+   * document we have since lost cannot corrupt our state.
+   */
+  private onWindowMessage = (event: MessageEvent): void => {
+    if (event.origin !== location.origin) return;
+    const data = event.data as { __pinhole?: string } | null;
+    if (!data || data.__pinhole !== "ws-attach") return;
+
+    const port = event.ports[0];
+    if (!port) return;
+    port.onmessage = (e) => void this.onShimMessage(port, e.data as ShimMessage);
+    port.start();
+    // Lets the shim tell "the shell never saw me" apart from "the shell saw me
+    // and the websocket failed", which are very different bugs to chase.
+    port.postMessage({ __pinhole: "ws-ack" });
+  };
+
+  private async onShimMessage(port: MessagePort, msg: ShimMessage): Promise<void> {
+    switch (msg.t) {
+      case "open":
+        await this.openWebSocket(port, msg);
+        break;
+      case "send": {
+        const session = this.wsSessions.get(msg.id);
+        if (!session) return;
+        try {
+          session.raw.send(msg.data);
+        } catch (e) {
+          // `send` throws only when the socket is not open, which the shim's
+          // readyState already reflects; surface it rather than swallowing it.
+          port.postMessage({ t: "error", id: msg.id, message: String(e) });
+        }
+        break;
+      }
+      case "close":
+        this.wsSessions.get(msg.id)?.raw.close(msg.code, msg.reason);
+        break;
+    }
+  }
+
+  private async openWebSocket(
+    port: MessagePort,
+    msg: Extract<ShimMessage, { t: "open" }>,
+  ): Promise<void> {
+    const fail = (message: string, code = 1006): void => {
+      port.postMessage({ t: "error", id: msg.id, message });
+      port.postMessage({ t: "close", id: msg.id, code, reason: message, wasClean: false });
+    };
+
+    if (!this.tunnel || this.tunnel.status !== "connected") {
+      fail("tunnel is not connected");
+      return;
+    }
+
+    let hostname: string;
+    try {
+      hostname = new URL(msg.url).hostname;
+    } catch {
+      fail(`invalid websocket url: ${msg.url}`);
+      return;
+    }
+    if (!this.interceptDomains.includes(hostname)) {
+      fail(`no tunnel serves ${hostname}`);
+      return;
+    }
+
+    const headers: Record<string, string> = {};
+    // Prefer the cookie we saw on real traffic: an HttpOnly session cookie is
+    // invisible to `document.cookie`, and service panels keep their session
+    // there. Fall back to what the shim could read.
+    const cookie = this.cookies.get(hostname) ?? msg.cookie;
+    if (cookie) headers["cookie"] = cookie;
+    if (navigator.userAgent) headers["user-agent"] = navigator.userAgent;
+
+    try {
+      const pipe = await this.tunnel.openDuplex(new Uint8Array(0));
+
+      const raw = new RawWebSocket(
+        pipe,
+        msg.url,
+        msg.protocols ?? [],
+        headers,
+        msg.origin || location.origin,
+        // Always hand the shim ArrayBuffers; it applies its own `binaryType`.
+        "arraybuffer",
+        {
+          open: (protocol) => {
+            port.postMessage({ t: "open", id: msg.id, protocol });
+          },
+          message: (data) => {
+            const binary = typeof data !== "string";
+            const buffer = binary ? (data as ArrayBuffer) : null;
+            port.postMessage(
+              {
+                t: "message",
+                id: msg.id,
+                data: binary ? buffer : data,
+                binary,
+                bufferedAmount: pipe.bufferedAmount(),
+              },
+              buffer ? [buffer] : [],
+            );
+          },
+          error: (message) => {
+            port.postMessage({ t: "error", id: msg.id, message });
+          },
+          close: (code, reason, wasClean) => {
+            this.wsSessions.delete(msg.id);
+            port.postMessage({ t: "close", id: msg.id, code, reason, wasClean });
+          },
+        },
+      );
+
+      this.wsSessions.set(msg.id, { raw, port });
+    } catch (e) {
+      fail(String(e));
+    }
   }
 }

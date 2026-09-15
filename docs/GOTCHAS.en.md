@@ -160,13 +160,37 @@ go func() {
 
 ## 2. HTTP over DataChannel
 
-### 2.1 A Service Worker cannot intercept WebSocket
+### 2.1 A Service Worker cannot intercept WebSocket (so transparency takes a detour)
 
 | | |
 |---|---|
-| **Symptom** | You assume `new WebSocket()` in the page will automatically go through the tunnel. It does not |
-| **Cause** | **The `fetch` event does not fire for a WebSocket upgrade.** A SW can only intercept fetch/XHR/navigation/resource requests |
-| **Fix** | Have the page use a custom `WebSocket` shim (which internally goes over the DataChannel); transparency is not achievable |
+| **Symptom** | `new WebSocket()` in the page does not go through the tunnel. HTTP works fine; only realtime features (terminals, log streaming, chat) fail to connect |
+| **Cause** | **The `fetch` event does not fire for a WebSocket upgrade.** A SW can intercept fetch/XHR/navigation/resources, but an upgrade request never reaches the `fetch` handler at all — that is the specification, not a browser bug |
+| **Fix** | Replace `window.WebSocket` **inside the proxied document**, implement an RFC 6455 client there, and carry the raw bytes over a data channel to the agent |
+
+**Why the protocol has to be reimplemented**: the agent is a **transparent TCP pipe** (see §1.x) — it parses neither HTTP nor WebSocket. So the handshake and the framing can only live on the browser side. The upside is that "the transport layer never needs to know what it is carrying" survives intact; the cost is that the browser side genuinely has to implement RFC 6455.
+
+Making it transparent takes three steps:
+
+| Step | What happens |
+|---|---|
+| ① **Inject** | For every response with `mode === "navigate"` — that is the proxied document in the iframe — the worker **streams a rewrite** that inserts `<script src="/pinhole-shim.js?d=<domains>">` right after `<head>` |
+| ② **Channel** | The shim hands a `MessagePort` to the shell page with `window.top.postMessage(…, [port])` — the tunnel lives in a **page**, not in the worker (see §2.4). Every frame after that rides the port; the worker is no longer involved |
+| ③ **Protocol** | The shell page opens one data channel per WebSocket and runs the RFC 6455 client on it |
+
+Step ② uses a single port rather than one `postMessage` per socket because terminal-style apps open and close sockets on every reconnect, while the port only has to be handed over once.
+
+**The three traps that are easiest to underestimate**:
+
+| Trap | Consequence |
+|---|---|
+| Not answering the server's **protocol-level pings** | The connection is killed after 75 s (1Panel pings every 30 s and times out at 75 s) |
+| Losing **close codes** | A semantic code such as `4410` degrades to `1006` and the frontend's reconnect logic stops working |
+| Panels that **authenticate with an `HttpOnly` cookie** | See §2.12 — this one is **structural**, not a bug that can be fixed |
+
+**Also, do not offer `Sec-WebSocket-Protocol` casually**: per WHATWG, if the client offers subprotocols and the server selects none, the connection must be failed. Our client does exactly that (fidelity), so offering one to a server that never negotiates will fail — which is correct behaviour. 1Panel offers none at all (`new WebSocket(conn)`, one argument).
+
+> **Lesson**: something `fetch` cannot intercept is not automatically impossible to make transparent — but the price is **implementing the protocol layer the browser will not give you**.
 
 ### 2.2 Range requests are not an optional optimisation
 
@@ -585,6 +609,90 @@ setInterval(() => {
 > Anything it needs to remember across wake-ups **must either be persisted or be re-told by the page periodically** —
 > and "re-told by the page periodically" is simpler, at the cost that the page must do it **proactively**
 > and cannot assume that "configure it once and it works forever".
+
+---
+
+### 2.12 A Service Worker cannot read the `Cookie` header — and cannot touch `HttpOnly` at all
+
+| | |
+|---|---|
+| **Symptom** | HTTP and WebSocket both work, but any backend that **authenticates with a cookie** answers 401 — the page loads, then logging in lands you back at "not logged in" |
+| **Cause** | `FetchEvent.request.headers` contains **no `Cookie`**. The browser removes forbidden headers from the list script can observe, and this worker **rebuilds the request from those headers**, so the target sees an anonymous request |
+| **Fix** | Read the cookie jar through the **Cookie Store API** (`self.cookieStore` in a SW) and put it back |
+
+**Measured: this is what a SW actually sees** (same-origin GET, and the browser plainly did send the cookie):
+
+```json
+{
+  "host": "localhost:8090",
+  "connection": "close",
+  "accept": "*/*",
+  "user-agent": "Mozilla/5.0 …",
+  "sec-ch-ua": "…", "sec-ch-ua-mobile": "?0", "sec-ch-ua-platform": "\"Windows\""
+}
+```
+
+`cookie`, `referer` and `accept-language` are **all absent**.
+
+**This was broken the whole time.** Not "HttpOnly is a problem" — **not even an ordinary cookie was ever forwarded.** It went unnoticed because the AList / static-drive scenarios this started with use a token in the URL and never rely on cookies.
+
+After the fix, non-`HttpOnly` cookies work. But **`HttpOnly` is a hard limit**:
+
+| Observation point | Result |
+|---|---|
+| Bypassing the worker, on the browser's own network stack | `cookie: psession=…; plainprobe=visible` ← both present |
+| `cookieStore.getAll()` inside the worker | `n=1`, **only `plainprobe`** |
+| A request through the tunnel | only `plainprobe` |
+
+`HttpOnly` means "script cannot read it", and **a Service Worker is script**. Therefore:
+
+> **No Service-Worker-based proxy can ever forward an `HttpOnly` cookie.**
+> This is not an implementation defect; it is the ceiling of this approach. BTunnel uses the same mechanism (its `sw.js` likewise rebuilds the request from `request.headers`), so it has exactly the same limit.
+
+**For 1Panel specifically**, the session cookie is hard-coded `HttpOnly`:
+
+```go
+// core/init/session/psession/psession.go
+c.SetCookie(constant.SessionName, sessionID, ttlSeconds, "/", "", secure, true)
+//                                                                        ^^^^ httpOnly
+```
+
+So **1Panel's terminal cannot authenticate through pinhole.** The only remaining route is to change layers: the agent is a raw byte pipe and **can see `Set-Cookie`**, so it could remember the value and attach `Cookie` to later requests — never asking the browser for the cookie at all. The cost is that the agent stops being a pure pipe and starts reading HTTP headers.
+
+---
+
+### 2.13 A write before the data channel is open is silently dropped
+
+| | |
+|---|---|
+| **Symptom** | A WebSocket sits in `CONNECTING` forever and the server **never even receives the upgrade request**; the HTTP path is perfectly fine |
+| **Cause** | The promise resolved as soon as `createDataChannel()` returned, while `readyState` was still `connecting`. The `if (readyState !== "open") return` guard in `send()` **threw the handshake away without a word** |
+| **Fix** | Queue writes issued before open and flush them in order from `onopen` |
+
+**Why the HTTP path never exposed it**: HTTP sends its initial payload *inside* `dc.onopen`, so it cannot hit this. A WebSocket client writes its handshake the instant it is constructed, so it hits it every time.
+
+**This is the same mistake as §1.5, from the other side**: on the agent it was "the peer started sending before I registered a handler"; here it is "I wrote before the channel was ready".
+
+> **Lesson**: **never assume the channel is ready for its first write.** Both ends have to be written as if it might not be.
+
+---
+
+### 2.14 Inserting a tag into somebody else's HTML has four details you must handle
+
+| | |
+|---|---|
+| **Symptom** | The shim works sometimes and not others; or the page's layout is inexplicably wrong |
+| **Cause** | Compression, length, insertion point and CSP — miss any one and it breaks |
+| **Fix** | See the table |
+
+| Detail | Consequence of ignoring it | What to do |
+|---|---|---|
+| **Compression** | You are holding gzip bytes; inserting into them produces garbage | Drop `accept-encoding` for navigations; if the response still carries `content-encoding`, give up on injecting |
+| **`Content-Length`** | The body just changed length, so the response is truncated or hangs | Delete the header when injecting (it becomes streamed) |
+| **Insertion point** | Inserting **before** `<!DOCTYPE>` triggers **quirks mode** and changes the entire layout | Insert after `<head>`; fall back to after `<!DOCTYPE>`; **never** put it at the very front |
+| **CSP** | An inline script is blocked outright by `script-src` | Use an **external** script, and pass the served domains in the script URL's **query string** — no inline script anywhere |
+
+**Also, do not buffer the whole HTML document before injecting**: hold back only up to the insertion point and pass everything after it straight through. Full buffering is what most proxies do, and it is precisely what makes first paint slow.
 
 ---
 

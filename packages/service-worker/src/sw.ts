@@ -49,6 +49,9 @@ interface PendingEntry {
   closed: boolean;
   /** Request `Origin`, when the caller is cross-origin. */
   origin: string | null;
+  /** Whether the response body should have the websocket shim injected. */
+  inject: boolean;
+  injector: Injector | null;
 }
 
 /**
@@ -77,13 +80,160 @@ const sw = globalThis as unknown as ServiceWorkerGlobalScope;
  *
  * An entry ending in "/" is a prefix match; anything else is an exact match.
  */
-const DEFAULT_PASSTHROUGH = ["/sw.js", "/config.js", "/index.html", "/assets/"];
+const DEFAULT_PASSTHROUGH = ["/sw.js", "/pinhole-shim.js", "/config.js", "/index.html", "/assets/"];
 let passthrough: string[] = [...DEFAULT_PASSTHROUGH];
 
 function isPassthrough(pathname: string): boolean {
   return passthrough.some((entry) =>
     entry.endsWith("/") ? pathname.startsWith(entry) : pathname === entry,
   );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Injecting the websocket shim
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * How much of a document to look at before giving up and injecting anyway.
+ *
+ * Every real document has `<head>` or a doctype within its first few hundred
+ * bytes. The cap only exists so that a body which never contains either (a
+ * fragment, or something not HTML at all despite its content-type) still gets
+ * streamed rather than buffered forever.
+ */
+const INJECT_CAP = 64 * 1024;
+
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+
+export interface Injector {
+  push(chunk: Uint8Array): Uint8Array[];
+  finish(): Uint8Array[];
+}
+
+/** Case-insensitive ASCII search for `needle`, returning the index or -1. */
+function indexOfAscii(haystack: Uint8Array, needle: string, from = 0): number {
+  const first = needle.charCodeAt(0);
+  const upper = first >= 97 ? first - 32 : first;
+  for (let i = from; i + needle.length <= haystack.length; i++) {
+    if (haystack[i] !== first && haystack[i] !== upper) continue;
+    let ok = true;
+    for (let j = 1; j < needle.length; j++) {
+      const c = haystack[i + j];
+      const want = needle.charCodeAt(j);
+      if (c !== want && c !== (want >= 97 ? want - 32 : want)) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) return i;
+  }
+  return -1;
+}
+
+/**
+ * Where to put the `<script>`: immediately after `<head>`'s opening tag, so it
+ * runs before any of the service's own scripts.
+ *
+ * Falls back to just after the doctype. Never before it — a script ahead of the
+ * doctype puts the document into quirks mode, which changes layout in ways that
+ * would be blamed on the proxy.
+ */
+function findInsertionPoint(bytes: Uint8Array): number {
+  const head = indexOfAscii(bytes, "<head");
+  if (head !== -1) {
+    const end = bytes.indexOf(0x3e, head); // '>'
+    if (end !== -1) return end + 1;
+  }
+  const doctype = indexOfAscii(bytes, "<!doctype");
+  if (doctype !== -1) {
+    const end = bytes.indexOf(0x3e, doctype);
+    if (end !== -1) return end + 1;
+  }
+  return -1;
+}
+
+/**
+ * A streaming rewriter that inserts `tag` at the first safe point.
+ *
+ * It holds back only the head of the document — everything after the insertion
+ * point is passed straight through, so a large document still streams and its
+ * first paint is not delayed by the whole body. Buffering the entire response
+ * would have been simpler and is what most proxies do; it is also exactly the
+ * behaviour that makes a large download crawl.
+ */
+export function makeInjector(tag: string): Injector {
+  const tagBytes = encoder.encode(tag);
+  let held: Uint8Array[] = [];
+  let heldLength = 0;
+  let done = false;
+
+  const flush = (insertAt: number, bytes: Uint8Array): Uint8Array[] => {
+    const out = new Uint8Array(bytes.length + tagBytes.length);
+    if (insertAt <= 0) {
+      out.set(tagBytes, 0);
+      out.set(bytes, tagBytes.length);
+    } else {
+      out.set(bytes.subarray(0, insertAt), 0);
+      out.set(tagBytes, insertAt);
+      out.set(bytes.subarray(insertAt), insertAt + tagBytes.length);
+    }
+    return [out];
+  };
+
+  return {
+    push(chunk: Uint8Array): Uint8Array[] {
+      if (done) return [chunk];
+      held.push(chunk);
+      heldLength += chunk.length;
+
+      const joined = concat(held);
+      const at = findInsertionPoint(joined);
+      if (at === -1 && heldLength < INJECT_CAP) return [];
+
+      done = true;
+      held = [];
+      heldLength = 0;
+      return flush(at, joined);
+    },
+    finish(): Uint8Array[] {
+      if (done) return [];
+      done = true;
+      const joined = concat(held);
+      held = [];
+      heldLength = 0;
+      return flush(-1, joined);
+    },
+  };
+}
+
+function concat(chunks: Uint8Array[]): Uint8Array {
+  const total = chunks.reduce((sum, c) => sum + c.length, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    out.set(c, offset);
+    offset += c.length;
+  }
+  return out;
+}
+
+function isHtml(headers: Record<string, string>): boolean {
+  const type = headers["content-type"] ?? "";
+  return type.toLowerCase().includes("text/html");
+}
+
+/**
+ * The script tag injected into every proxied document.
+ *
+ * The served domains ride along in the query string rather than in an inline
+ * script: an inline script is the first thing a `script-src` policy blocks, and
+ * the shim needs that list to decide — synchronously, from its constructor —
+ * which URLs to tunnel.
+ */
+function shimTag(): string {
+  const domains = encodeURIComponent([...servedHostnames()].join(","));
+  return `<script src="/pinhole-shim.js?d=${domains}"></script>`;
 }
 
 /**
@@ -153,6 +303,47 @@ async function tunnelFor(
 
 const pending = new Map<string, PendingEntry>();
 
+interface CookieStoreLike {
+  getAll(options?: { url?: string }): Promise<Array<{ name: string; value: string }>>;
+}
+/**
+ * The cookie jar, read through the Cookie Store API.
+ *
+ * `FetchEvent.request.headers` does **not** contain `Cookie`. The browser strips
+ * forbidden header names from any header list script can observe, and `Cookie`
+ * is the one that costs the most here: this worker *reconstructs* the request
+ * from those headers, so a cookie-authenticated service sees an anonymous
+ * request and answers 401. In practice that means most self-hosted panels —
+ * 1Panel, qBittorrent and their like all keep the session in a cookie, usually
+ * `HttpOnly`, so `document.cookie` cannot supply it either.
+ *
+ * `cookieStore` is the API the browser provides for exactly this case. In a
+ * service worker global scope it includes `HttpOnly` cookies: they are hidden
+ * from *documents* to blunt XSS, not from the worker, which is already
+ * origin-trusted code acting for the site.
+ */
+async function cookiesFor(url: string): Promise<string> {
+  const store = (self as unknown as { cookieStore?: CookieStoreLike }).cookieStore;
+  if (!store) return "";
+
+  const join = (list: Array<{ name: string; value: string }>): string =>
+    list.map((c) => `${c.name}=${c.value}`).join("; ");
+
+  // Prefer the URL-scoped form, which is what a multi-hostname setup needs. It
+  // throws on some builds, and the no-argument form is equivalent here — the
+  // worker's own origin *is* the origin being served — so fall back rather than
+  // letting the whole request lose its cookies over an API quirk.
+  try {
+    return join(await store.getAll({ url }));
+  } catch {
+    try {
+      return join(await store.getAll());
+    } catch {
+      return "";
+    }
+  }
+}
+
 // Take over immediately instead of waiting for every controlled tab to close.
 //
 // A waiting worker is normally a safe, polite default. It is the wrong default
@@ -205,19 +396,43 @@ sw.addEventListener("message", (event: ExtendableMessageEvent) => {
     case "proxy-head": {
       const entry = pending.get(msg.id);
       if (!entry) break;
+
+      // Rewrite the document only when we can actually read it. A compressed
+      // body would have to be inflated first, and injecting into bytes we
+      // cannot parse would corrupt the page — worse than not injecting at all.
+      // `accept-encoding` is dropped for navigations so this is the normal case.
+      let headers = msg.headers;
+      if (entry.inject && isHtml(headers) && !headers["content-encoding"]) {
+        entry.injector = makeInjector(shimTag());
+        headers = { ...headers };
+        // The body is about to change length, and it is now streamed.
+        delete headers["content-length"];
+        delete headers["content-encoding"];
+      }
+
       const stream = new ReadableStream<Uint8Array>({
         start(controller) {
           entry.controller = controller;
-          for (const c of entry.queue) controller.enqueue(c);
-          entry.queue.length = 0;
-          if (entry.closed) controller.close();
+          const queued = entry.queue;
+          entry.queue = [];
+          for (const c of queued) {
+            for (const part of entry.injector ? entry.injector.push(c) : [c]) {
+              controller.enqueue(part);
+            }
+          }
+          if (entry.closed) {
+            for (const part of entry.injector ? entry.injector.finish() : []) {
+              controller.enqueue(part);
+            }
+            controller.close();
+          }
         },
       });
       entry.resolve(
         new Response(stream, {
           status: msg.status,
           statusText: msg.statusText,
-          headers: withCors(msg.headers, entry.origin),
+          headers: withCors(headers, entry.origin),
         }),
       );
       break;
@@ -227,10 +442,13 @@ sw.addEventListener("message", (event: ExtendableMessageEvent) => {
       const entry = pending.get(msg.id);
       if (!entry) break;
       const chunk = new Uint8Array(msg.chunk);
-      if (entry.controller) {
-        entry.controller.enqueue(chunk);
-      } else {
-        entry.queue.push(chunk);
+      const parts = entry.injector ? entry.injector.push(chunk) : [chunk];
+      for (const part of parts) {
+        if (entry.controller) {
+          entry.controller.enqueue(part);
+        } else {
+          entry.queue.push(part);
+        }
       }
       break;
     }
@@ -239,7 +457,12 @@ sw.addEventListener("message", (event: ExtendableMessageEvent) => {
       const entry = pending.get(msg.id);
       if (!entry) break;
       entry.closed = true;
-      if (entry.controller) entry.controller.close();
+      if (entry.controller) {
+        if (entry.injector) {
+          for (const part of entry.injector.finish()) entry.controller.enqueue(part);
+        }
+        entry.controller.close();
+      }
       pending.delete(msg.id);
       break;
     }
@@ -333,10 +556,31 @@ async function proxy(event: FetchEvent): Promise<Response> {
   const id = crypto.randomUUID();
   const body = await request.arrayBuffer();
 
+  // A navigation that reaches here is the service being loaded into the shell's
+  // iframe (top-level navigations are answered with the shell itself), so its
+  // document is exactly where the websocket shim has to be injected.
+  const inject = request.mode === "navigate";
+
   const headers: Record<string, string> = {};
   request.headers.forEach((value, key) => {
     headers[key] = value;
   });
+  // See cookiesFor: the cookie is not in `request.headers`, so it has to be
+  // fetched from the cookie jar or the target never authenticates.
+  // See cookiesFor: the cookie is not in `request.headers`, so it has to be
+  // fetched from the cookie jar or the target never authenticates. Only
+  // non-HttpOnly cookies are visible here — see the note in GOTCHAS.
+  if (!headers["cookie"]) {
+    const cookie = await cookiesFor(request.url);
+    if (cookie) headers["cookie"] = cookie;
+  }
+  if (inject) {
+    // Ask for the document uncompressed. Rewriting HTML requires being able to
+    // read it, and the shim cannot be injected into gzip. This costs bandwidth
+    // on markup only — the payloads this project exists for are already
+    // compressed and are not navigations.
+    delete headers["accept-encoding"];
+  }
 
   const client = await tunnelFor(event, new URL(request.url).hostname);
   if (!client) {
@@ -356,6 +600,8 @@ async function proxy(event: FetchEvent): Promise<Response> {
       queue: [],
       closed: false,
       origin,
+      inject,
+      injector: null,
     });
   });
 

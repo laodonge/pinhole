@@ -106,31 +106,34 @@
 | ICE 配置 | ✅ 由信令下发（可集中配 TURN） | ⚠️ 写死在 `config.js` |
 | **TURN 兜底** | ✅ 带 coturn 配置 | ❌ 靠 IPv6，或如实承认打不通 |
 | **自定义域名** | ❌ 用它自己的域名 | ✅ 用你自己的子域名 |
-| **免安装（浏览器）能承载的协议** | HTTP + **WebSocket**（页面里覆盖 `window.WebSocket` 做虚拟化） | 只有 **HTTP**（不含 WebSocket） |
+| **免安装（浏览器）能承载的协议** | HTTP + **WebSocket**（页面里覆盖 `window.WebSocket`） | HTTP + **WebSocket** ✅（做法见 [GOTCHAS §2.1](docs/GOTCHAS.md#21-service-worker-拦不到-websocket透明化要绕一大圈)） |
+| **HttpOnly cookie 认证** | ❌ 转发不了 | ❌ **同样转发不了**——这是 SW 方案的结构性天花板，不是实现缺陷（[§2.12](docs/GOTCHAS.md#212-service-worker-读不到-cookie-头httponly-更是彻底拿不到)） |
+| **非 HttpOnly cookie 认证** | 未说明 | ✅ 转发（这一条之前一直是坏的，已修） |
 | **装了 CLI 之后能承载的协议** | **任意 TCP + UDP**（`internal/proxy/tcp.go`、`udp.go`） | 不做——pinhole 没有 CLI 客户端那一端 |
 | Docker / TUI | ✅ Docker sidecar 隔离、实时 TUI | ❌ |
-| 文档 | README + 配置指南 | **28 条踩坑记录**（每条「症状 → 原因 → 修法 → 怎么发现」）+ 实测数据 |
+| 文档 | README + 配置指南 | **36 条踩坑记录**（每条「症状 → 原因 → 修法 → 怎么发现」）+ 实测数据 |
 | 活跃度 | 3 次提交跨度 0.8 小时，此后未更新，1 star | 真机跑通、有实测数字 |
 
-**从 BTunnel 可以学的五件事**（这些 pinhole 目前做得不如它）：
+**从 BTunnel 学到的东西**（前四件 pinhole 做得不如它，第五件已经补上）：
 
 1. **`MessagePort` 直连**——页面把 port 转移给 SW，SW 直接用它收发，**从根上消除"哪个 frame 持有隧道"这个问题**。代价是 SW 被回收后 port 失效，需要重新 attach。
 2. **CLI 内嵌信令进程**——`btunnel run` 自动在后台起信令，不需要用户单独开一个终端。
 3. **一次性 token**——用后即废，比可重复使用的共享密钥更安全（但需要服务端签发）。
 4. **ICE 配置由信令下发**——可以集中改 STUN/TURN，不用让每个用户改自己的配置文件。
-5. **把 `window.WebSocket` 虚拟化**——浏览器开不了裸 TCP，但能开 WebSocket。BTunnel 在页面里把 `window.WebSocket` 换成一个走 DataChannel 的假实现（`WS_CONNECT` / `WS_DATA` / `WS_CLOSE` 三类帧），于是 HTTP 之外还能承载 WebSocket 服务，**这是免安装模式下唯一还能扩的协议面**。它这个实现本身有缺口：没有 `addEventListener`（只有 `onmessage` 这类属性，用 `addEventListener` 的库会直接 `not a function`），没有 `WebSocket.OPEN` 之类静态常量，`send()` 在未 OPEN 时抛异常而不是排队。pinhole 目前没有这块。
+5. ~~把 `window.WebSocket` 虚拟化~~——**pinhole 现在也做了**。浏览器开不了裸 TCP，但能开 WebSocket，这是免安装模式下唯一还能扩的协议面。我们的做法是：SW 把垫片**注入被代理的文档**，垫片把 `MessagePort` 交给外壳页，外壳页跑一个自己实现的 RFC 6455 客户端（见 [§2.1](docs/GOTCHAS.md#21-service-worker-拦不到-websocket透明化要绕一大圈)）。它那个实现本身的缺口——没有 `addEventListener`、没有 `WebSocket.OPEN` 静态常量、`send()` 在未 OPEN 时抛异常而不排队——我们都补齐了。
 
 **另外，同一个坑它也踩过：** 它的 `sw.js` 把隧道端口放在模块级变量里，页面定时发 `PING_TUNNEL`，SW 发现端口没了就广播 `REQUEST_TUNNEL_PORT` 让页面重新交接——**这正是 pinhole [GOTCHAS §2.11](docs/GOTCHAS.md#211-service-worker-会被回收) 那个"SW 被回收"问题的独立佐证**：换一套 SW↔页面通道设计（它用 `MessagePort`，pinhole 用 `postMessage`），这个坑照样在。
 
 **所以诚实的定位是：**
 
 > pinhole **不是一个新机制**。它是在同一个机制上，把**信令做成零服务器**、把**域名所有权交还用户**，
-> 并且**把一路上踩到的 28 个坑逐条写下来**的一个实现。
+> 并且**把一路上踩到的 36 个坑逐条写下来**的一个实现。
 
-**要功能更全的话，BTunnel 的覆盖面更大**（Docker / TCP / UDP / WebSocket / TURN 兜底 / TUI），
+**要功能更全的话，BTunnel 的覆盖面更大**（Docker / TCP / UDP / TURN 兜底 / TUI），
 而且它在 **SW↔页面通道**这个细节上的设计比 pinhole 干净。
-但有一点必须分清楚：**它那些"任意协议"的能力，全部在装 CLI 的那条路上。免安装那条路，它同样只有 HTTP（外加一个 WebSocket 垫片）。**
+但有一点必须分清楚：**它那些"任意协议"的能力，全部在装 CLI 的那条路上。免安装那条路，它同样只有 HTTP + WebSocket。**
 也就是说，如果诉求是"访问者一点东西都不用装"，可选空间本来就这么大——pinhole 并没有比它少一块**能用**的地。
+两边也都撞在同一堵墙上：**免安装这条路转发不了 HttpOnly cookie**（[§2.12](docs/GOTCHAS.md#212-service-worker-读不到-cookie-头httponly-更是彻底拿不到)）。
 **要弄懂这条路到底有哪些坑，那才是这份仓库存在的理由。**
 
 ---
@@ -144,6 +147,7 @@
   │   RTCPeerConnection  │◄── P2P ───►│   DataChannel → TCP    │
   │   Service Worker     │  WebRTC    │   转发到                │
   │   （拦截虚拟域名）      │            │   127.0.0.1:xxxx       │
+  │   注入的 WS 垫片       │            │   （不解析内容）          │
   └──────────────────────┘            └────────────────────────┘
             │                                    ▲
             └──── 信令（SDP/ICE，几 KB）─────────┘
@@ -155,8 +159,10 @@
 | 特点 | 说明 |
 |---|---|
 | **浏览器零安装** | 框架无关的 Web Component + Service Worker 透明代理，现有 HTTP 服务不用改 |
+| **HTTP + WebSocket** | Service Worker 拦不到 WebSocket，所以垫片被**注入进被代理的页面**，并在浏览器侧自己实现 RFC 6455（[§2.1](docs/GOTCHAS.md#21-service-worker-拦不到-websocket透明化要绕一大圈)） |
 | **数据 100% P2P** | 信令之外没有任何中继，数据跑满服务器本地上行 |
 | **信令可零服务器** | 既可用自建 WS 服务器，也可骑公共 MQTT broker（见下） |
+| **agent 不解析内容** | 每条 DataChannel 就是一根到 `127.0.0.1:xxxx` 的裸 TCP 管道——正因如此，加 WebSocket 没有改一行 Go |
 
 ## 快速开始
 

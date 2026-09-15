@@ -112,31 +112,34 @@ The full reasoning is in **[docs/GOTCHAS.en.md § 6](docs/GOTCHAS.en.md)**.
 | ICE configuration | ✅ Delivered by signaling (TURN can be configured centrally) | ⚠️ Hard-coded in `config.js` |
 | **TURN fallback** | ✅ Ships coturn config | ❌ Relies on IPv6, or admits it will not connect |
 | **Custom domain** | ❌ Uses their domain | ✅ Uses your own subdomain |
-| **Protocols over zero-install (browser)** | HTTP + **WebSocket** (it replaces `window.WebSocket` in the page with a virtualised one) | **HTTP only** (no WebSocket) |
+| **Protocols over zero-install (browser)** | HTTP + **WebSocket** (it replaces `window.WebSocket` in the page with a virtualised one) | HTTP + **WebSocket** ✅ (how, in [GOTCHAS §2.1](docs/GOTCHAS.en.md)) |
+| **`HttpOnly` cookie auth** | ❌ Cannot be forwarded | ❌ **Also cannot be forwarded** — the structural ceiling of any Service-Worker approach, not an implementation defect ([§2.12](docs/GOTCHAS.en.md)) |
+| **Non-`HttpOnly` cookie auth** | Not stated | ✅ Forwarded (this was broken all along and is now fixed) |
 | **Protocols once a CLI is installed** | **Any TCP + UDP** (`internal/proxy/tcp.go`, `udp.go`) | Not offered — pinhole has no CLI-client side |
 | Docker / TUI | ✅ Docker sidecar isolation, live TUI | ❌ |
-| Documentation | README + a configuration guide | **28 documented traps** ("symptom → cause → fix → how we found out") + measured numbers |
+| Documentation | README + a configuration guide | **36 documented traps** ("symptom → cause → fix → how we found out") + measured numbers |
 | Activity | 3 commits over 0.8 h, untouched since, 1 star | Runs on real hardware, with measured numbers |
 
-**Five things worth learning from BTunnel** (places where it is ahead of pinhole):
+**What we learned from BTunnel** (the first four are places it is ahead of pinhole; the fifth is now done):
 
 1. **A transferred `MessagePort`** — the page hands the worker one end of a channel, so the worker never has to determine which frame holds the tunnel. That removes the whole problem class at the root. The cost is that the port dies if the worker is recycled, so it must be re-attached.
 2. **An embedded signaling process** — `btunnel run` starts signaling in the background; the user does not need a second terminal.
 3. **Single-use tokens** — consumed on join, which is stronger than a reusable shared secret (but needs a server to issue them).
 4. **ICE configuration delivered over signaling** — STUN/TURN can be changed centrally instead of in every user's config file.
-5. **Virtualising `window.WebSocket`** — a browser cannot open raw TCP, but it can open a WebSocket. BTunnel replaces `window.WebSocket` in the page with a fake that rides the DataChannel (`WS_CONNECT` / `WS_DATA` / `WS_CLOSE` frames), which buys it WebSocket services on top of HTTP — **the only remaining room to grow on the zero-install path**. Their implementation has gaps of its own: no `addEventListener` (only properties such as `onmessage`, so any library that uses `addEventListener` dies with `not a function`), no static constants such as `WebSocket.OPEN`, and `send()` throws before OPEN instead of queuing. pinhole does not have this at all.
+5. ~~**Virtualising `window.WebSocket`**~~ — **pinhole does this now too**. A browser cannot open raw TCP but it can open a WebSocket, and that is the only remaining room to grow on the zero-install path. Ours works by having the worker **inject a shim into the proxied document**, the shim handing a `MessagePort` to the shell page, and the shell page running its own RFC 6455 client (see [GOTCHAS §2.1](docs/GOTCHAS.en.md)). The gaps their implementation has — no `addEventListener`, no static constants such as `WebSocket.OPEN`, `send()` throwing before OPEN instead of queuing — are all covered here.
 
 **The same trap caught them too:** their `sw.js` keeps the tunnel port in a module-scope variable, the page sends `PING_TUNNEL` on a timer, and the worker broadcasts `REQUEST_TUNNEL_PORT` when the port has vanished so the page can re-attach — **independent corroboration of the "the Service Worker gets recycled" problem in pinhole [GOTCHAS §2.11](docs/GOTCHAS.en.md)**: swap the worker↔page channel design (theirs is a `MessagePort`, ours is `postMessage`) and the trap is still there.
 
 **So the honest positioning is:**
 
 > pinhole **is not a new mechanism**. It is an implementation of the same mechanism with **serverless signaling**,
-> **domain ownership handed back to the user**, and **the 28 traps written down one by one**.
+> **domain ownership handed back to the user**, and **the 36 traps written down one by one**.
 
-**If you want a fuller tool, BTunnel covers more ground** (Docker / TCP / UDP / WebSocket / TURN fallback / TUI), and its
+**If you want a fuller tool, BTunnel covers more ground** (Docker / TCP / UDP / TURN fallback / TUI), and its
 design for the worker↔page channel is cleaner than pinhole's.
-But one distinction matters: **all of its "any protocol" capability lives on the path where you install the CLI. On the zero-install path it too has only HTTP, plus a WebSocket shim.**
+But one distinction matters: **all of its "any protocol" capability lives on the path where you install the CLI. On the zero-install path it too has only HTTP + WebSocket.**
 So if the requirement is "the visitor installs nothing", the available room is simply this small — pinhole is not missing a piece of *usable* ground that BTunnel has.
+Both also hit the same wall: **the zero-install path cannot forward an `HttpOnly` cookie** ([§2.12](docs/GOTCHAS.en.md)).
 **If you want to understand which traps this road actually has, that is the reason this repository exists.**
 
 ---
@@ -150,19 +153,22 @@ So if the requirement is "the visitor installs nothing", the available room is s
    │   RTCPeerConnection  │◄── P2P ───►│   DataChannel → TCP    │
    │   Service Worker     │  WebRTC    │   forwards to          │
    │   (intercepts hosts) │            │   127.0.0.1:xxxx       │
+   │   injected WS shim   │            │   (parses nothing)     │
    └──────────────────────┘            └────────────────────────┘
              │                                    ▲
              └──── signaling (SDP/ICE, few KB) ───┘
                    self-hosted WS  ·  public MQTT (no server)
 ```
 
-**Three properties:**
+**Four properties:**
 
 | Property | What it means |
 |---|---|
 | **Zero install on the browser** | A framework-agnostic Web Component plus a Service Worker transparent proxy; **your existing HTTP service does not change** |
+| **HTTP + WebSocket** | A Service Worker cannot intercept WebSocket, so a shim is **injected into the proxied page** and the RFC 6455 client is implemented on the browser side ([§2.1](docs/GOTCHAS.en.md)) |
 | **Data is 100% P2P** | Nothing but signaling goes through anything but the two endpoints; transfers run at your machine's own uplink speed |
 | **Signaling can need no server** | Either self-host a WebSocket signaling server, or ride a public MQTT broker |
+| **The agent parses nothing** | Every data channel is a raw TCP pipe to `127.0.0.1:xxxx` — which is why adding WebSocket required no Go changes at all |
 
 ## Quick start
 

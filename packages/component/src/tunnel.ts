@@ -3,6 +3,20 @@ import type { SignalingChannel, SignalMessage } from "./signaling";
 export type TunnelStatus = "disconnected" | "connecting" | "connected" | "error";
 
 /**
+ * A bidirectional byte pipe over one data channel.
+ *
+ * Structurally identical to `BytePipe` in `ws.ts`, which is what lets the
+ * WebSocket client run on top of a tunnel without either module importing the
+ * other.
+ */
+export interface Duplex {
+  readable: ReadableStream<Uint8Array>;
+  send(data: Uint8Array): void;
+  close(): void;
+  bufferedAmount(): number;
+}
+
+/**
  * Data channel tuning. Mirrors the constants in the Go agent.
  *
  * `MAX_MESSAGE_SIZE` is the interoperable ceiling across browsers — Chrome
@@ -176,6 +190,23 @@ export class Tunnel {
   }
 
   request(data: Uint8Array): Promise<ReadableStream<Uint8Array>> {
+    return this.openDuplex(data).then((pipe) => pipe.readable);
+  }
+
+  /**
+   * Open a long-lived, bidirectional byte pipe to the target.
+   *
+   * One data channel carries one TCP connection on the agent side, so this is
+   * the same mechanism `request` uses; the difference is that it stays writable
+   * for as long as it is open. That is what a WebSocket needs: `request` is
+   * fire-and-forget, and a websocket that cannot write back is not a websocket.
+   *
+   * Writes are serialised through a promise chain. `sendChunked` awaits when the
+   * send buffer is full, so two concurrent calls would otherwise be free to
+   * interleave their chunks — which for a byte stream means corruption, not
+   * reordering.
+   */
+  openDuplex(initial: Uint8Array): Promise<Duplex> {
     if (!this.pc || this._status !== "connected") {
       return Promise.reject(new Error("tunnel not connected"));
     }
@@ -184,21 +215,36 @@ export class Tunnel {
     const dc = this.pc.createDataChannel(`req-${id}`);
     dc.binaryType = "arraybuffer";
 
-    return new Promise<ReadableStream<Uint8Array>>((resolve, reject) => {
+    return new Promise<Duplex>((resolve, reject) => {
       const queue: Uint8Array[] = [];
+      /** Writes issued before the channel opened, kept in order. */
+      const preopen: Uint8Array[] = [];
       let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
       let closed = false;
       let opened = false;
+      let chain: Promise<void> = Promise.resolve();
+
+      const fail = (message: string): void => {
+        closed = true;
+        if (controller) controller.error(new Error(message));
+      };
 
       dc.onopen = () => {
         opened = true;
-        // Chunked + paced: a single send of a large body exceeds the
-        // interoperable max message size, and an unpaced loop would grow the
-        // SCTP send buffer without bound. See sendChunked below.
-        void sendChunked(dc, data).catch(() => {
-          closed = true;
-          if (controller) controller.error(new Error("datachannel send failed"));
-        });
+        // The initial payload first, then anything the caller wrote before the
+        // channel opened. Dropping those would be silent and very confusing: a
+        // websocket client writes its handshake the instant it is constructed,
+        // so the symptom is a server that never answers — or, worse, one that
+        // answers nothing at all because it never saw a request.
+        const queued = preopen.splice(0, preopen.length);
+        chain = chain
+          .then(() => sendChunked(dc, initial))
+          .then(async () => {
+            for (const item of queued) await sendChunked(dc, item);
+          })
+          .catch(() => {
+            fail("datachannel send failed");
+          });
       };
       dc.onmessage = (e) => {
         const chunk = new Uint8Array(e.data as ArrayBuffer);
@@ -216,12 +262,9 @@ export class Tunnel {
         closed = true;
         if (controller) controller.close();
       };
-      dc.onerror = () => {
-        closed = true;
-        if (controller) controller.error(new Error("datachannel error"));
-      };
+      dc.onerror = () => fail("datachannel error");
 
-      const stream = new ReadableStream<Uint8Array>({
+      const readable = new ReadableStream<Uint8Array>({
         start(c) {
           controller = c;
           for (const chunk of queue) c.enqueue(chunk);
@@ -233,7 +276,30 @@ export class Tunnel {
         },
       });
 
-      resolve(stream);
+      resolve({
+        readable,
+        send(data: Uint8Array) {
+          if (closed) return;
+          if (!opened) {
+            preopen.push(data);
+            return;
+          }
+          if (dc.readyState !== "open") return;
+          chain = chain.then(() => sendChunked(dc, data)).catch(() => {
+            fail("datachannel send failed");
+          });
+        },
+        close() {
+          if (closed) return;
+          closed = true;
+          try {
+            dc.close();
+          } catch {
+            // Already closing.
+          }
+        },
+        bufferedAmount: () => dc.bufferedAmount,
+      });
     });
   }
 

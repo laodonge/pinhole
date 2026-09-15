@@ -160,13 +160,37 @@ go func() {
 
 ## 二、HTTP over DataChannel
 
-### 2.1 Service Worker 拦不到 WebSocket
+### 2.1 Service Worker 拦不到 WebSocket（透明化要绕一大圈）
 
 | | |
 |---|---|
-| **症状** | 以为页面里的 `new WebSocket()` 会自动走隧道，结果没有 |
-| **原因** | **`fetch` 事件不会为 WebSocket 升级触发**。SW 只能拦截 fetch/XHR/导航/资源请求 |
-| **修法** | 让页面使用一个自定义的 `WebSocket` shim（内部走 DataChannel），做不到透明 |
+| **症状** | 页面里的 `new WebSocket()` 不走隧道。HTTP 一切正常，只有实时功能（终端、日志推送、聊天）连不上 |
+| **原因** | **`fetch` 事件不会为 WebSocket 升级触发**。SW 能拦 fetch/XHR/导航/资源，但升级请求根本不进 `fetch` 处理器——这是规范层面的，不是浏览器 bug |
+| **修法** | 在**被代理的文档里**把 `window.WebSocket` 换掉，自己实现 RFC 6455 客户端，再把原始字节借一条 DataChannel 送到 agent |
+
+**为什么必须自己实现一遍协议**：agent 是一根**透明的 TCP 管道**（见 §1.x），它不解析 HTTP，也不解析 WebSocket。所以握手和分帧只能放在浏览器侧。好处是守住了「传输层不知道自己在传什么」这条线；代价是浏览器侧真的要实现一遍 RFC 6455。
+
+透明化分三步：
+
+| 步骤 | 做什么 |
+|---|---|
+| ① **注入** | SW 对每个 `mode === "navigate"` 的响应（也就是 iframe 里那个被代理的文档）做**流式改写**，在 `<head>` 之后插一个 `<script src="/pinhole-shim.js?d=<域名>">` |
+| ② **通道** | 垫片用 `window.top.postMessage(…, [port])` 把 `MessagePort` 交给外壳页——隧道活在**页面**里，不在 SW 里（见 §2.4）。之后所有帧走这条 port，SW 不再参与 |
+| ③ **协议** | 外壳页为每条 WebSocket 开一条 DataChannel，在上面跑 RFC 6455 客户端 |
+
+第 ② 步选 port 而不是"每个 socket 一条 postMessage"，是因为终端类应用每次重连都会开关 socket，而 port 只需要交接一次。
+
+**最容易低估的三个坑**：
+
+| 坑 | 后果 |
+|---|---|
+| 服务端的**协议级 ping 没人回** | 连接活 75 秒后被杀（1Panel 正是 30 秒 ping / 75 秒超时） |
+| **关闭码**丢失 | `4410` 这类语义码退化成 `1006`，前端的重连逻辑直接失效 |
+| 面板类应用**认证靠 HttpOnly cookie** | 见 §2.12——这是**结构性**的，不是能修的 bug |
+
+**另外，`Sec-WebSocket-Protocol` 不能乱发**：按 WHATWG，客户端提供了子协议而服务端没选，就必须判定连接失败。我们的客户端照做了（保真），所以给一个不接受子协议的服务端发子协议会失败——这是对的行为。1Panel 就是一个子协议都不发的（`new WebSocket(conn)`，单参数）。
+
+> **教训**：`fetch` 拦不到的东西不代表做不到透明，但代价是**把浏览器缺的那层协议自己补上**。
 
 ### 2.2 Range 请求不是可选优化
 
@@ -584,6 +608,90 @@ setInterval(() => {
 > 任何它需要跨唤醒记住的东西，**要么持久化，要么由页面定期重新告知**——
 > 而"由页面定期重新告知"更简单，代价是页面必须**主动**做这件事，
 > 不能假设"配置一次就永久生效"。
+
+---
+
+### 2.12 Service Worker 读不到 `Cookie` 头，HttpOnly 更是彻底拿不到
+
+| | |
+|---|---|
+| **症状** | HTTP 和 WebSocket 都通了，但任何**靠 cookie 认证**的后端一律 401——页面能加载，一登录就"未登录" |
+| **原因** | `FetchEvent.request.headers` 里**没有 `Cookie`**。浏览器会把禁止的头从"脚本可见的头列表"里剔掉，而 pinhole 是**用这些头重建请求**的，于是目标看到的是匿名请求 |
+| **修法** | 用 **Cookie Store API**（SW 里的 `self.cookieStore`）读 cookie jar 补回去 |
+
+**实测：SW 看到的头长这样**（同源 GET，浏览器本身明明带了 cookie）：
+
+```json
+{
+  "host": "localhost:8090",
+  "connection": "close",
+  "accept": "*/*",
+  "user-agent": "Mozilla/5.0 …",
+  "sec-ch-ua": "…", "sec-ch-ua-mobile": "?0", "sec-ch-ua-platform": "\"Windows\""
+}
+```
+
+`cookie`、`referer`、`accept-language` **全都不在里面**。
+
+**这一条在此之前一直是坏的。** 不是"HttpOnly 有问题"——而是**连普通 cookie 都没转发过**。之前没暴露，是因为 AList / 静态网盘那类场景用的是 URL 里的 token，不靠 cookie。
+
+修完之后，非 HttpOnly 的 cookie 正常了。但 **HttpOnly 是硬限制**：
+
+| 观察点 | 结果 |
+|---|---|
+| 绕过 SW、走浏览器自己的网络栈 | `cookie: psession=…; plainprobe=visible` ← 两个都在 |
+| SW 里 `cookieStore.getAll()` | `n=1`，**只有 `plainprobe`** |
+| 经隧道的请求 | 只有 `plainprobe` |
+
+`HttpOnly` 的定义就是"脚本读不到"，而 **Service Worker 也是脚本**。所以：
+
+> **任何基于 Service Worker 的代理都不可能转发 HttpOnly cookie。**
+> 这不是实现缺陷，是这条路的天花板。BTunnel 用的是同一套机制（它的 `sw.js` 同样从 `request.headers` 重建请求），所以它有完全一样的限制。
+
+**具体到 1Panel**：它的会话 cookie 写死了 HttpOnly——
+
+```go
+// core/init/session/psession/psession.go
+c.SetCookie(constant.SessionName, sessionID, ttlSeconds, "/", "", secure, true)
+//                                                                        ^^^^ httpOnly
+```
+
+所以 **1Panel 的终端无法通过 pinhole 认证**。要解决只能换一层：agent 是原始字节管道，它**看得见 `Set-Cookie`**，可以由它记住并在后续请求里补 `Cookie`——那样根本不需要问浏览器要 cookie。代价是 agent 从"纯管道"变成"会看一眼 HTTP 头"。
+
+---
+
+### 2.13 DataChannel 还没 open 时的写入会被静默丢弃
+
+| | |
+|---|---|
+| **症状** | WebSocket 永远停在 `CONNECTING`，服务端**连升级请求都没收到**；而 HTTP 路径完全正常 |
+| **原因** | `createDataChannel()` 之后立刻 resolve，此时 `readyState` 还是 `connecting`。`send()` 里那句 `if (readyState !== "open") return` 把握手**悄悄扔掉了** |
+| **修法** | open 之前的写入排进队列，在 `onopen` 里按序 flush |
+
+**为什么 HTTP 路径没暴露**：HTTP 的初始 payload 是在 `dc.onopen` **内部**发的，天然撞不上。WebSocket 客户端是"一构造就发握手"，正好撞上。
+
+**这和 §1.5 是同一个错误的两个方向**：agent 那边是「对端在我注册 handler 之前就发了」，这边是「我在信道就绪之前就发了」。
+
+> **教训**：**信道上的第一次写入，不能假设信道已经就绪。** 两端都要按"可能还没好"来写。
+
+---
+
+### 2.14 往别人的 HTML 里插标签，有四个必须处理的细节
+
+| | |
+|---|---|
+| **症状** | 垫片时灵时不灵；或者页面样式莫名错乱 |
+| **原因** | 压缩、长度、插入点、CSP 四件事，少一件就出问题 |
+| **修法** | 见下表 |
+
+| 细节 | 不处理的后果 | 做法 |
+|---|---|---|
+| **压缩** | 拿到的是 gzip 字节，插进去就是乱码 | 对导航请求**去掉 `accept-encoding`**；响应若仍带 `content-encoding` 就放弃注入 |
+| **`Content-Length`** | 注入后长度变了，响应被截断或挂住 | 注入时删掉该头（改为流式） |
+| **插入点** | 插在 `<!DOCTYPE>` **之前**会触发**怪异模式**，整个页面布局都变了 | 插在 `<head>` 之后；没有 `<head>` 才退到 `<!DOCTYPE>` 之后；**绝不放到最前面** |
+| **CSP** | 内联脚本被 `script-src` 直接拦掉 | 用**外链**脚本，并把服务域名塞进**脚本 URL 的查询串**，全程不出现内联脚本 |
+
+**另外不要整包缓冲 HTML 再注入**：只缓冲到插入点为止，之后原样透传。整包缓冲是大多数代理的做法，也正是让首屏变慢的原因。
 
 ---
 
