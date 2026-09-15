@@ -20,9 +20,15 @@ window.__ET_CONFIG = {
   signalKind: "mqtt",
 
   /**
-   * STUN 服务器。
+   * STUN 服务器 —— **只是兜底**。
    *
-   * 默认值是 Cloudflare 的，**国内可能不可用**——建议换成自建的，或国内可达的公共 STUN。
+   * 正常情况下用不到这里：agent 会在自己的 presence 公告里带上它的 ICE 配置
+   * （来自 `agent.json` 的 `stun`），浏览器优先用 agent 给的那个。
+   *
+   * 理由：**要被打通的那一端才知道哪个 STUN 从它的网络可达**，而且这样
+   * STUN 只需要配一个地方，不会出现 agent.json 和这里写得不一样的情况。
+   *
+   * 这里保留一个值，是为了应对 agent 没配 STUN（或用的是自建 WS 信令）的情况。
    */
   stun: "stun:stun.cloudflare.com:3478",
 

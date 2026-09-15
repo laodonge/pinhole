@@ -33,9 +33,8 @@ import (
 )
 
 const (
-	mqttTopicPrefix      = "etproxy/"
-	mqttPresenceInterval = 5 * time.Second
-	mqttKeepalive        = 30 * time.Second
+	mqttTopicPrefix = "etproxy/"
+	mqttKeepalive   = 30 * time.Second
 )
 
 // mqttEnvelope is the wire format. `P` is signed byte-for-byte as transmitted,
@@ -105,7 +104,6 @@ func DialMQTTSignaling(rawURL, room, secret, role string) (*MQTTSignaling, error
 	}
 
 	go s.readLoop()
-	go s.presenceLoop()
 
 	return s, nil
 }
@@ -199,26 +197,10 @@ func (s *MQTTSignaling) handleEnvelope(payload []byte) {
 	}
 }
 
-func (s *MQTTSignaling) presenceLoop() {
-	s.announce()
-	ticker := time.NewTicker(mqttPresenceInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			s.announce()
-		case <-s.done:
-			return
-		}
-	}
-}
-
-// announce publishes presence. MQTT has no retained messages here, so a peer
-// that connects later only learns about us from a fresh announcement — hence
-// the periodic repeat.
-func (s *MQTTSignaling) announce() {
-	_ = s.Send(SignalMessage{Type: "peer-joined", ID: s.id, Role: s.role})
-}
+// Presence is announced by the Agent (see Agent.announceLoop), not here: it has
+// to carry the ICE configuration, which the agent owns, and the WebSocket
+// backend needs the same behaviour. Keeping it in one place means the two
+// backends cannot drift.
 
 func (s *MQTTSignaling) sign(payload string) string {
 	mac := hmac.New(sha256.New, []byte(s.secret))

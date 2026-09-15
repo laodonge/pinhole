@@ -111,7 +111,7 @@ https://你的域名/?key=<和 agent.json 里的 secret 一致>
 | `-room` | 房间名 |
 | `-secret` | 访问密钥（mqtt 模式必填） |
 | `-target` | 本地 TCP 目标 |
-| `-stun` | STUN 服务器，传空字符串可禁用 |
+| `-stun` | STUN 服务器。**会随 presence 公告下发给浏览器**，所以通常只要配这一处；传空字符串可禁用。逗号分隔可配多个，scheme 可省略 |
 | `-listen` | `signal` 模式的监听地址 |
 
 **优先级：内置默认 → `agent.json` → 命令行参数。** 只有**显式传入**的参数才覆盖配置文件——

@@ -41,7 +41,9 @@ async function sendChunked(dc: RTCDataChannel, payload: Uint8Array): Promise<voi
 
 export class Tunnel {
   private signal: SignalingChannel;
+  /** Fallback STUN, used only when the agent does not announce its own. */
   private stun: string;
+  private announcedIceServers: string[] | null = null;
   private pc: RTCPeerConnection | null = null;
   private agentId = "";
   private seq = 0;
@@ -60,6 +62,13 @@ export class Tunnel {
       if (!this.isForMe(msg)) return;
       if (msg.role === "agent" && this._status === "disconnected") {
         this.agentId = msg.id ?? "";
+        // The agent announces its own ICE configuration; prefer it over ours.
+        //
+        // It is the end that has to be reachable, so it is the end that knows
+        // which STUN/TURN server works from its network — and taking it from
+        // there means the value lives in one place (agent.json) instead of
+        // having to match the page's config.js as well.
+        if (msg.iceServers?.length) this.announcedIceServers = msg.iceServers;
         this.connect();
       }
     });
@@ -103,7 +112,10 @@ export class Tunnel {
   }
 
   private connect(): void {
-    this.pc = new RTCPeerConnection({ iceServers: [{ urls: this.stun }] });
+    // Prefer the agent's announced ICE servers; fall back to our own. An empty
+    // list is legitimate — on a LAN the host candidates are enough.
+    const urls = this.announcedIceServers ?? (this.stun ? [this.stun] : []);
+    this.pc = new RTCPeerConnection({ iceServers: urls.map((u) => ({ urls: u })) });
     const pc = this.pc;
 
     pc.onicecandidate = (e) => {

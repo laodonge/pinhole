@@ -17,6 +17,16 @@ type SignalMessage struct {
 	Candidate string `json:"candidate,omitempty"`
 	From      string `json:"from,omitempty"`
 	To        string `json:"to,omitempty"`
+
+	// ICEServers rides along with the agent's presence announcement, so the
+	// browser learns which STUN/TURN server to use from the machine that has to
+	// be reachable — the one that knows which server is reachable from its
+	// network. It also leaves one place to change it, instead of a value that
+	// has to match in both agent.json and the page's config.js.
+	//
+	// Strings, not a struct, because that is exactly the `urls` field the
+	// browser's RTCIceServer takes.
+	ICEServers []string `json:"iceServers,omitempty"`
 }
 
 // SignalingChannel is what the agent needs from a signaling backend.

@@ -273,6 +273,46 @@ go run ./packages/agent \
 **信令断开会自动重连**（指数退避，上限 30 秒；连接稳定超过 1 分钟则重置退避），
 所以公共 broker 被网络中断不会让服务一直暗着。
 
+### ICE 配置由 agent 下发给浏览器
+
+**agent 会周期性公告自己的 presence，公告里带着它的 ICE 配置**（来自 `-stun`）：
+
+```
+agent 公告  {type:"peer-joined", role:"agent", iceServers:["stun:stun.miwifi.com:3478"]}
+                ↓ 搭在已有的 presence 消息上，不增加任何流量
+浏览器收到 → 用它创建 RTCPeerConnection → config.js 里的 stun 只作兜底
+```
+
+**为什么这么做**：
+
+| 理由 | 说明 |
+|---|---|
+| **要被打通的那一端才知道** | 哪个 STUN 从它的网络可达，只有它自己清楚 |
+| **只配一个地方** | 否则 `agent.json` 和引导页的 `config.js` 各写一份，还可能写得不一样 |
+| **`-stun` 更宽容** | `stun.miwifi.com:3478` 和 `stun:stun.miwifi.com:3478` 都可以，scheme 自动补 |
+
+`config.js` 里的 `stun` **降级为兜底**，只在 agent 没配 STUN 时生效。
+
+**周期性重播还顺带修掉一个 WS 模式的顺序问题**：自建信令服务器只在"有人加入时"通知
+**已经在房间里的** peer，所以浏览器后加入的话永远等不到 agent 出现。现在 agent 每 5 秒重播一次，
+两种信令后端的行为就一致了。
+
+> 这个机制来自 **[BTunnel](https://github.com/BarronDEV/btunnel)**——它的信令服务器在
+> `SESSION_CREATED` 里下发 ICE Servers。我们用了同样的思路，但让它搭在已有的 MQTT presence
+> 公告上，因此**仍然不需要服务器**。见 [Prior art](#prior-art这个思路不是独创的)。
+
+#### 验证
+
+```bash
+cd packages/agent
+go test -run 'TestIceServerURLs|TestPresence|TestAnnounce' -v   # 公告与 scheme 归一化，无需网络，0.1 秒
+ET_MQTT_TEST=1 go test -run TestMQTTEndToEnd -v                # 整链路（信令 + 打洞 + HTTP + 吞吐）
+```
+
+> 值得一提：写这个功能时，端到端测试立刻抓到一个**预先存在的 bug**——`-stun` 写成不带
+> `stun:` 的 `host:port` 时，Pion 会直接报 `InvalidAccessError: unknown scheme type`。
+> 现在两条路径共用同一个归一化函数，不会再不一致。
+
 ### 验证 MQTT 互通（Go 端到端）
 
 ```bash

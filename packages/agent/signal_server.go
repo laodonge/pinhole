@@ -46,6 +46,17 @@ func (r *signalRoom) forwardToRole(role string, msg SignalMessage) {
 	}
 }
 
+// broadcast sends to every peer in the room except the sender.
+func (r *signalRoom) broadcast(fromID string, msg SignalMessage) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for pid, p := range r.peers {
+		if pid != fromID {
+			p.send(msg)
+		}
+	}
+}
+
 type signalServer struct {
 	mu    sync.Mutex
 	rooms map[string]*signalRoom
@@ -121,6 +132,22 @@ func (s *signalServer) handleWS(w http.ResponseWriter, r *http.Request) {
 			room.forwardTo(msg.To, SignalMessage{Type: "answer", SDP: msg.SDP, From: id})
 		case "ice":
 			room.forwardTo(msg.To, SignalMessage{Type: "ice", Candidate: msg.Candidate, From: id})
+
+		case "peer-joined":
+			// The agent re-announces itself periodically; relay it rather than
+			// leaving presence to the server.
+			//
+			// Two reasons. It carries the agent's ICE configuration, so the
+			// browser learns which STUN/TURN server to use. And it closes an
+			// ordering hole: the join path above only tells *existing* peers
+			// about a newcomer, so a browser that joins after the agent would
+			// otherwise never learn the agent exists.
+			room.broadcast(id, SignalMessage{
+				Type:       "peer-joined",
+				ID:         id,
+				Role:       role,
+				ICEServers: msg.ICEServers,
+			})
 		}
 	}
 }

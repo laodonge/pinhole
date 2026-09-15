@@ -5,7 +5,9 @@ import (
 	"io"
 	"log"
 	"net"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/pion/webrtc/v4"
 )
@@ -70,6 +72,15 @@ func NewAgent(target, stun string) *Agent {
 	}
 }
 
+// presenceInterval is how often the agent re-announces itself.
+//
+// Neither backend gives us presence for free. MQTT has no retained messages
+// here, and the WebSocket signaling server only tells *existing* peers about a
+// newcomer — so a browser that joins after the agent would never learn it
+// exists. Repeating also lets a client that missed one announcement catch the
+// next.
+const presenceInterval = 5 * time.Second
+
 // Run consumes signaling messages until the channel closes. The caller decides
 // which backend to use (self-hosted WebSocket or public MQTT) and passes it in.
 func (a *Agent) Run(sig SignalingChannel) error {
@@ -77,6 +88,11 @@ func (a *Agent) Run(sig SignalingChannel) error {
 	defer sig.Close()
 
 	log.Printf("agent connected to signaling, id=%s", sig.ID())
+	if servers := iceServerURLs(a.stun); len(servers) > 0 {
+		log.Printf("announcing ICE servers: %s", strings.Join(servers, ", "))
+	}
+
+	go a.announceLoop(sig)
 
 	for {
 		msg, err := sig.Read()
@@ -104,6 +120,65 @@ func (a *Agent) Run(sig SignalingChannel) error {
 			a.removePeer(msg.From)
 		}
 	}
+}
+
+// presenceMessage builds the agent's announcement.
+//
+// Separated from the loop so it can be tested directly: the message is a pure
+// transformation of the configured STUN value, and checking it should not have
+// to wait on the announce interval.
+func (a *Agent) presenceMessage(id string) SignalMessage {
+	msg := SignalMessage{Type: "peer-joined", ID: id, Role: "agent"}
+	if servers := iceServerURLs(a.stun); len(servers) > 0 {
+		msg.ICEServers = servers
+	}
+	return msg
+}
+
+// announceLoop keeps the agent's presence visible in the room.
+//
+// The announcement carries the agent's ICE configuration (see
+// SignalMessage.ICEServers). That is how the browser learns which STUN/TURN
+// server to use without the page hard-coding one — and it removes a value that
+// otherwise has to be kept in sync between agent.json and the page's config.js.
+func (a *Agent) announceLoop(sig SignalingChannel) {
+	announce := func() bool {
+		// A closed channel returns an error, which is how this goroutine ends.
+		return sig.Send(a.presenceMessage(sig.ID())) == nil
+	}
+
+	if !announce() {
+		return
+	}
+	ticker := time.NewTicker(presenceInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		if !announce() {
+			return
+		}
+	}
+}
+
+// iceServerURLs normalises the -stun value into the URLs a browser expects.
+//
+// The flag accepts a comma-separated list, and the scheme is added when it is
+// missing — so `stun.miwifi.com:3478` and `stun:stun.miwifi.com:3478` both work.
+// The same value feeds the agent's own ICE gathering and the browser's, so the
+// two ends cannot disagree.
+func iceServerURLs(value string) []string {
+	var out []string
+	for _, part := range strings.Split(value, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if !strings.HasPrefix(part, "stun:") && !strings.HasPrefix(part, "stuns:") &&
+			!strings.HasPrefix(part, "turn:") && !strings.HasPrefix(part, "turns:") {
+			part = "stun:" + part
+		}
+		out = append(out, part)
+	}
+	return out
 }
 
 func (a *Agent) handleOffer(msg SignalMessage) {
@@ -158,10 +233,15 @@ func (a *Agent) handleOffer(msg SignalMessage) {
 
 func (a *Agent) createPeer(clientID string) (*Peer, error) {
 	config := webrtc.Configuration{}
-	// An empty STUN is legitimate: on a LAN (and in tests) host candidates are
+	// Normalise through the same helper the announcement uses, so a bare
+	// `host:port` works for the agent's own gathering too. Pion rejects a URL
+	// with no scheme outright ("unknown scheme type"), and the two paths must
+	// agree on what -stun means.
+	//
+	// An empty value is legitimate: on a LAN (and in tests) host candidates are
 	// enough, and skipping the ICE server avoids waiting on an unreachable one.
-	if a.stun != "" {
-		config.ICEServers = []webrtc.ICEServer{{URLs: []string{a.stun}}}
+	if urls := iceServerURLs(a.stun); len(urls) > 0 {
+		config.ICEServers = []webrtc.ICEServer{{URLs: urls}}
 	}
 	pc, err := webrtc.NewPeerConnection(config)
 	if err != nil {

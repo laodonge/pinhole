@@ -282,6 +282,49 @@ lands in your shell history**.
 **Signaling failures reconnect automatically** (exponential backoff capped at 30 s; reset once a session has
 been healthy for a minute), so a dropped broker connection does not leave your service dark.
 
+### The agent hands its ICE configuration to the browser
+
+**The agent re-announces its presence periodically, and the announcement carries its ICE configuration**
+(taken from `-stun`):
+
+```
+agent announces  {type:"peer-joined", role:"agent", iceServers:["stun:stun.miwifi.com:3478"]}
+                      ↓ rides the presence message that already exists — no extra traffic
+browser receives → uses it for its RTCPeerConnection → config.js `stun` becomes a fallback
+```
+
+**Why it works this way:**
+
+| Reason | Detail |
+|---|---|
+| **The end that has to be reachable is the one that knows** | Only it knows which STUN server works from its network |
+| **One place to configure it** | Otherwise `agent.json` and the page's `config.js` each carry a copy, and they can disagree |
+| **`-stun` is more forgiving** | `stun.miwifi.com:3478` and `stun:stun.miwifi.com:3478` both work — the scheme is added when missing |
+
+`stun` in `config.js` is now **a fallback**, used only when the agent has no STUN configured.
+
+**The periodic repeat also closes an ordering hole in WebSocket mode**: that server only tells *existing*
+peers about a newcomer, so a browser joining after the agent would never learn it exists. The agent now
+repeats every 5 seconds, which makes both signaling backends behave the same way.
+
+> This mechanism comes from **[BTunnel](https://github.com/BarronDEV/btunnel)** — its signaling server
+> delivers ICE servers in `SESSION_CREATED`. We took the same idea but attached it to the MQTT presence
+> announcement that already existed, so it still **needs no server**. See
+> [Prior art](#prior-art-the-idea-is-not-ours).
+
+#### Verifying it
+
+```bash
+cd packages/agent
+go test -run 'TestIceServerURLs|TestPresence|TestAnnounce' -v   # announcement + scheme normalisation, no network, 0.1 s
+ET_MQTT_TEST=1 go test -run TestMQTTEndToEnd -v                # whole chain: signaling + punch + HTTP + throughput
+```
+
+> Worth noting: building this, the end-to-end test immediately caught a **pre-existing bug** — passing
+> `-stun` as a bare `host:port` with no `stun:` scheme makes Pion fail outright with
+> `InvalidAccessError: unknown scheme type`. Both paths now share one normalisation function, so they
+> cannot drift again.
+
 ### Verifying MQTT interop (Go end-to-end)
 
 ```bash

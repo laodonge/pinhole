@@ -6,6 +6,17 @@ export type SignalMessage = {
   candidate?: string;
   from?: string;
   to?: string;
+  /**
+   * The agent's ICE configuration, carried on its presence announcement.
+   *
+   * The agent is the end that has to be reachable, so it is the end that knows
+   * which STUN/TURN server works from its network. Taking it from there also
+   * leaves one place to change it, instead of a value the agent and the page
+   * both have to get right.
+   *
+   * These are the `urls` a `RTCIceServer` takes.
+   */
+  iceServers?: string[];
 };
 
 /**

@@ -83,7 +83,13 @@ func TestMQTTEndToEnd(t *testing.T) {
 	}
 	defer agentSig.Close()
 
-	agent := NewAgent(target, "") // empty STUN: host candidates suffice locally
+	// Empty STUN: host candidates are all this test needs, and depending on an
+	// external STUN server would make it flaky (on a host running a TUN-mode
+	// proxy, hostnames resolve to fake IPs).
+	//
+	// The ICE announcement is covered by unit tests in announce_test.go, where
+	// it can be checked without a real connection.
+	agent := NewAgent(target, "")
 	go func() {
 		if err := agent.Run(agentSig); err != nil {
 			t.Logf("agent stopped: %v", err)
@@ -138,7 +144,7 @@ func TestMQTTEndToEnd(t *testing.T) {
 			}
 			switch msg.Type {
 			case "peer-joined":
-				t.Logf("discovered peer id=%s role=%s", msg.ID, msg.Role)
+				t.Logf("discovered agent id=%s role=%s", msg.ID, msg.Role)
 			case "answer":
 				var desc webrtc.SessionDescription
 				if err := json.Unmarshal([]byte(msg.SDP), &desc); err != nil {
@@ -234,6 +240,9 @@ func TestMQTTEndToEnd(t *testing.T) {
 			t.Errorf("  FAIL  %s", c.name)
 		}
 	}
+
+	// The presence announcement itself (type, role, and the ICE configuration it
+	// carries) is asserted in announce_test.go — no connection required.
 
 	// ---- 5. throughput: is *our* implementation the bottleneck? -----------
 	//
