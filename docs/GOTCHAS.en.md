@@ -531,6 +531,55 @@ for (const id of [owner, ...tunnels.keys()]) { /* 命中即用 */ }
 > rather than maintaining a "current" pointer — **the latter fails silently the moment the second instance appears**,
 > and the symptom ("closing A breaks B") is a long way from the cause ("you only stored one variable").
 
+### 2.11 The Service Worker gets recycled, and what it remembered disappears with it
+
+| | |
+|---|---|
+| **Symptom** | **Everything works fine right after the page opens**; **come back a little later (roughly half a minute or more) and it no longer works** — requests are no longer proxied and instead land on static hosting, returning the host's own **404** |
+| **Cause** | The browser **terminates** an idle Service Worker after about 30 seconds, and "which domains to intercept" is **module-level state**, so it vanishes along with it. The page has **no idea at all** — it only ever sent `config` once, when the connection succeeded |
+| **Fix** | The page **re-sends** `config` **periodically**. This project does it every 20 seconds, shorter than the idle timeout |
+
+```
+页面连上 → 发 config → SW 记住 domains ✅
+    ↓ 用户看了会儿页面（约 30 秒）
+SW 被回收 → domains 没了
+    ↓
+页面仍以为"拦截是开着的"
+    ↓
+请求的 hostname 不在 domains 里 → fetch 处理器直接 return
+    ↓
+请求落到静态托管 → 404（或边缘超时的 408）
+```
+
+**Why it is especially hard to spot**:
+
+| Trait | Consequence |
+|---|---|
+| **It is time-dependent** | It is always fine right after opening and only breaks a while later — very easy to attribute to "network flakiness" |
+| **The symptom is a 404** | It looks like "the target service does not have this path" rather than "the proxy is not in effect" |
+| **Development and self-testing usually click fast** | Our own first test on a real device was clicked within seconds, **and the result was good**; it only surfaced when someone else clicked again a while later |
+
+**One coincidence inside the fix is worth calling out on its own**: setting the heartbeat interval to **20 seconds** (shorter than the 30-second idle timeout)
+**solves two things at once**:
+
+1. The message itself counts as activity → **the SW usually never gets recycled at all**
+2. If it does get recycled anyway → the next heartbeat **restores the registration** within 20 seconds
+
+```js
+// 页面侧
+setInterval(() => {
+  if (configAckInFlight) return;                  // 避免 ack 槽位竞争
+  applyInterception(tunnel.status === "connected");
+}, 20_000);
+```
+
+> **Lesson**: **as long as you put state in a Service Worker's module scope, you must assume it can disappear at any moment.**
+>
+> A SW is not a long-lived process, but something that "gets woken by events and killed when idle".
+> Anything it needs to remember across wake-ups **must either be persisted or be re-told by the page periodically** —
+> and "re-told by the page periodically" is simpler, at the cost that the page must do it **proactively**
+> and cannot assume that "configure it once and it works forever".
+
 ---
 
 ## 3. Signalling
