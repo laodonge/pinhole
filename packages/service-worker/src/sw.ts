@@ -65,8 +65,6 @@ const ALLOW_METHODS = "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS";
 
 const sw = globalThis as unknown as ServiceWorkerGlobalScope;
 
-let domains: string[] = [];
-
 /**
  * Path prefixes that must never be proxied.
  *
@@ -89,39 +87,68 @@ function isPassthrough(pathname: string): boolean {
 }
 
 /**
- * The client that owns the tunnel.
+ * Which client is tunnelling which hostnames.
  *
- * Requests for the virtual host can originate from *any* frame in the origin:
- * the shell itself, the proxied service running inside the iframe, and every
- * subresource either of them loads. Only the shell holds the WebRTC connection,
- * so every request has to be routed there.
- *
- * Using `event.clientId` instead looks correct and is not: it names whoever
- * *made* the request. A fetch issued from inside the iframe would be posted to
- * the iframe, where nothing is listening — the message disappears and the
- * request hangs forever with no error. In practice that breaks every CSS file,
- * script, and XHR belonging to the proxied service, while the initial iframe
- * load (initiated by the shell) works fine, which makes it look like a bug in
- * the service rather than in the plumbing.
+ * Keyed by client id, because more than one tab can hold a tunnel at once. A
+ * single "current owner" cannot represent that: with two tabs open the second
+ * registration overwrites the first, every request from both tabs then rides the
+ * second tab's tunnel, and closing that tab breaks the first one too.
  */
-let ownerClientId: string | null = null;
+const tunnels = new Map<string, string[]>();
 
-async function tunnelClient(event: FetchEvent): Promise<Client | undefined> {
-  if (ownerClientId) {
-    const owner = await sw.clients.get(ownerClientId);
-    if (owner) return owner;
-    ownerClientId = null; // the shell navigated away or closed
+/**
+ * Maps a frame to the top-level client whose tunnel should serve it.
+ *
+ * The WebRTC connection lives in the shell (a top-level frame); the service runs
+ * in an iframe nested inside it, and both ends issue requests. `Client` exposes
+ * no parent, so the relationship is recorded at the one moment both are visible
+ * at once: while a frame is navigating, `clientId` is whoever initiated that
+ * navigation (the shell that set `src`) and `resultingClientId` is the frame
+ * about to be created. Every later request from that frame carries the
+ * resulting id as its `clientId`, and this map turns it back into the shell.
+ *
+ * This is what the naive `event.clientId` routing got wrong in the other
+ * direction: it named the *requester*, so a fetch from inside the iframe was
+ * posted to the iframe, where nothing is listening.
+ */
+const frameOwner = new Map<string, string>();
+
+/** Every hostname any live tunnel serves. */
+function servedHostnames(): Set<string> {
+  const out = new Set<string>();
+  for (const hosts of tunnels.values()) {
+    for (const host of hosts) out.add(host);
   }
+  return out;
+}
 
-  const clients = await sw.clients.matchAll({
-    type: "window",
-    includeUncontrolled: true,
-  });
-  // The shell is a top-level frame; the proxied service lives nested inside it.
-  const topLevel = clients.find(
-    (c) => (c as WindowClient).frameType === "top-level",
-  );
-  return topLevel ?? (await sw.clients.get(event.clientId)) ?? clients[0];
+/**
+ * Which client should carry this request.
+ *
+ * Order matters: the requesting frame's own tunnel wins, and that is exactly
+ * what keeps two tabs independent. The fallback to any tunnel serving the
+ * hostname covers the case where a recycled worker has lost `frameOwner` and
+ * cannot rebuild it for frames that are already loaded — it degrades to the old
+ * shared behaviour rather than to a hang.
+ */
+async function tunnelFor(
+  event: FetchEvent,
+  hostname: string,
+): Promise<Client | null> {
+  const requester = event.clientId || event.resultingClientId || "";
+  const owner = frameOwner.get(requester) ?? requester;
+
+  for (const id of [owner, ...tunnels.keys()]) {
+    const hosts = tunnels.get(id);
+    if (!hosts?.includes(hostname)) continue;
+
+    const client = await sw.clients.get(id);
+    if (client) return client;
+
+    // The tab is gone; stop offering it.
+    tunnels.delete(id);
+  }
+  return null;
 }
 
 const pending = new Map<string, PendingEntry>();
@@ -147,20 +174,31 @@ sw.addEventListener("message", (event: ExtendableMessageEvent) => {
 
   switch (msg.type) {
     case "config": {
-      domains = msg.domains ?? [];
+      const source = event.source as Client | null;
+      const requested = msg.domains ?? [];
+
+      // Registration is per client, so two tabs coexist instead of overwriting
+      // each other. An empty list means "I am not tunnelling anything right
+      // now" — the page sends that while disconnected — so drop it rather than
+      // leaving a dead entry behind.
+      if (source?.id) {
+        if (requested.length > 0) {
+          tunnels.set(source.id, requested);
+        } else {
+          tunnels.delete(source.id);
+        }
+      }
+
       // Empty means "keep the safe default" rather than "proxy everything".
       passthrough = msg.passthrough?.length
         ? msg.passthrough
         : [...DEFAULT_PASSTHROUGH];
-      // Whoever configured interception owns the tunnel; every proxied request
-      // from this origin is routed back to it. See tunnelClient().
-      const source = event.source as Client | null;
-      if (source?.id) ownerClientId = source.id;
+
       // Ack: the page must know interception is actually in effect before it
       // issues a request that has to be proxied (loading the service into an
       // iframe). Without this the iframe can race the config and receive the
       // bootstrap shell instead of the service.
-      event.source?.postMessage({ type: "config-ack", domains });
+      event.source?.postMessage({ type: "config-ack", domains: requested });
       break;
     }
 
@@ -231,8 +269,17 @@ sw.addEventListener("message", (event: ExtendableMessageEvent) => {
 
 sw.addEventListener("fetch", (event: FetchEvent) => {
   const url = new URL(event.request.url);
-  if (!domains.includes(url.hostname)) {
+  if (!servedHostnames().has(url.hostname)) {
     return;
+  }
+
+  // Record who owns a frame that is about to be created, while both ends are
+  // visible at once. See frameOwner.
+  if (event.resultingClientId) {
+    const initiator = event.clientId || frameOwner.get(event.clientId) || "";
+    if (initiator && initiator !== event.resultingClientId) {
+      frameOwner.set(event.resultingClientId, initiator);
+    }
   }
 
   // Never proxy the shell's own files — see DEFAULT_PASSTHROUGH.
@@ -291,9 +338,9 @@ async function proxy(event: FetchEvent): Promise<Response> {
     headers[key] = value;
   });
 
-  const client = await tunnelClient(event);
+  const client = await tunnelFor(event, new URL(request.url).hostname);
   if (!client) {
-    return new Response("no client", {
+    return new Response("no tunnel for this hostname", {
       status: 503,
       headers: withCors(
         { "content-type": "text/plain; charset=utf-8" },

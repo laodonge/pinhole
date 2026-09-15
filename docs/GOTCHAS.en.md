@@ -380,6 +380,53 @@ async function tunnelClient(event: FetchEvent): Promise<Client | undefined> {
 > Once you introduce a structure where "one frame holds a capability and other frames need to use it" (iframe + shared connection, worker + main thread),
 > you must explicitly record the **capability holder**, rather than relying on the initiator identity carried by the request.
 
+#### Appendix: a cleaner approach (from BTunnel)
+
+In [BTunnel](https://github.com/BarronDEV/btunnel) we saw another solution, **which eliminates this problem at the root**:
+the page creates a `MessageChannel` and **transfers** one end of it to the Service Worker, after which all two-way communication goes over that port.
+
+```js
+// 页面侧：建通道，把 port2 转移给 SW
+const channel = new MessageChannel();
+navigator.serviceWorker.controller.postMessage(
+  { type: "attach", port: channel.port2 },
+  [channel.port2],                       // ← 转移，不是复制
+);
+
+// SW 侧：拿到就直接用，不需要知道"谁持有隧道"
+self.addEventListener("message", (event) => {
+  const { type, port } = event.data;
+  if (type === "attach" && port) tunnelPort = port;
+});
+// 之后所有请求都 tunnelPort.postMessage(...)
+```
+
+| | Client lookup (what this project does today) | `MessagePort` (what BTunnel does) |
+|---|---|---|
+| Does it need to record the holder | ✅ Yes (`ownerClientId` + top-level frame fallback) | ❌ **No** |
+| Cost per request | One `clients.get()` / `matchAll()` | No lookup |
+| Multi-frame ambiguity | Has to be inferred from `frameType === "top-level"` | Does not exist |
+| **After the SW is recycled** | ✅ Still findable (the client is still there) | ❌ The port is dead; you have to **create a new channel** and attach again |
+| Conceptual model | "who sent it ≠ who can handle it" (counter-intuitive) | "the page handed the SW a line" (intuitive) |
+
+#### So why does this project still choose the client lookup
+
+Looking at that table, it is easy to conclude that "`MessagePort` is better". **But neither the measurements nor the risk support that conclusion**:
+
+| Argument | The actual situation |
+|---|---|
+| **Is "one lookup per request" a bottleneck** | ❌ **No**. The full browser path measured **476 Mbps** (64 MiB). `clients.get()` happens once per **request**, not once per 16 KB message, and it is sub-millisecond — against the main scenario of "one request transferring several GB", amortised it comes out at zero |
+| **What is "eliminating the holder concept" worth** | That is a **readability** gain, about 15 lines of code; and the price is introducing the new lifecycle problem that "the port is a consumable" |
+| **The risk of switching** | ⚠️ **The browser path has no automated tests** (the Go e2e cannot reach the SW). Changes can only be verified by hand on real devices: mobile data, switching to the background, locking the screen, opening two tabs… |
+| **A hybrid (port first + lookup fallback)** | ❌ **The worst**: two paths to maintain and two concepts to understand, while the performance gain **cannot be measured** — twice the cost, zero extra benefit |
+
+**Conclusion: for a design from scratch, choose `MessagePort`; for an implementation that already works, is documented, and has just had its bugs fixed, leave it alone.**
+This project is the latter ✅
+
+> **A more general rule of thumb**: when two approaches are **tied on the measurable metrics**,
+> the deciding factor is no longer "which one is more elegant" but **"how risky is it to change"**.
+> And "the core path has no automated tests" is a very hard reason — it turns "elegant" into "a gamble".
+
 ### 2.9 The page gets frozen in the background → the tunnel dies silently while the Worker is still intercepting
 
 | | |
