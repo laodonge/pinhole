@@ -12,6 +12,15 @@ interface ProxyRequest {
   body: ArrayBuffer;
 }
 
+/**
+ * How often the page re-asserts its registration with the worker.
+ *
+ * Must be shorter than the worker's idle timeout (~30 s in Chrome), because the
+ * registration lives in the worker's module state and dies when it is
+ * terminated. See startHeartbeat for the full story.
+ */
+const REGISTRATION_HEARTBEAT_MS = 20_000;
+
 export class PinholeTunnelElement extends HTMLElement {
   static observedAttributes = [
     "signal",
@@ -49,6 +58,8 @@ export class PinholeTunnelElement extends HTMLElement {
   private configAck: (() => void) | null = null;
   /** Held while connected when `wake-lock` is set. */
   private wakeLock: WakeLockSentinel | null = null;
+  /** Re-asserts the worker registration. See REGISTRATION_HEARTBEAT_MS. */
+  private heartbeat: ReturnType<typeof setInterval> | null = null;
 
   connectedCallback(): void {
     document.addEventListener("visibilitychange", this.onVisibilityChange);
@@ -60,6 +71,38 @@ export class PinholeTunnelElement extends HTMLElement {
     document.removeEventListener("visibilitychange", this.onVisibilityChange);
     navigator.serviceWorker.removeEventListener("message", this.onSwMessage);
     this.stopSession();
+  }
+
+  /**
+   * How often the page re-asserts its registration with the worker.
+   *
+   * A Service Worker is terminated after roughly 30 seconds of inactivity, and
+   * everything it knows — which hostnames to intercept, and which frame owns
+   * which tunnel — is module-level state that dies with it. The page has no way
+   * to notice: requests simply stop being intercepted and fall through to the
+   * network, so a proxied path starts returning the *hosting* provider's own 404
+   * instead of the service's response. It looks exactly like the tunnel broke,
+   * and it only shows up if you wait a while before using the page.
+   *
+   * Posting more often than the idle timeout fixes it twice over: the message
+   * counts as activity, so the worker is normally never terminated at all, and if
+   * it ever is, the next beat restores the registration within this interval.
+   */
+  private startHeartbeat(): void {
+    this.stopHeartbeat();
+    this.heartbeat = setInterval(() => {
+      // Skip while a config round trip is already in flight —
+      // applyInterception keeps a single ack slot.
+      if (this.configAck) return;
+      void this.applyInterception(this.tunnel?.status === "connected");
+    }, REGISTRATION_HEARTBEAT_MS);
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeat !== null) {
+      clearInterval(this.heartbeat);
+      this.heartbeat = null;
+    }
   }
 
   /**
@@ -88,6 +131,7 @@ export class PinholeTunnelElement extends HTMLElement {
   };
 
   private stopSession(): void {
+    this.stopHeartbeat();
     void this.releaseWakeLock();
     this.tunnel?.close();
     this.signalClient?.close();
@@ -183,6 +227,7 @@ export class PinholeTunnelElement extends HTMLElement {
       }
     });
 
+    this.startHeartbeat();
     void this.registerSW();
   }
 
