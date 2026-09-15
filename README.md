@@ -107,8 +107,9 @@
 | **TURN 兜底** | ✅ 带 coturn 配置 | ❌ 靠 IPv6，或如实承认打不通 |
 | **自定义域名** | ❌ 用它自己的域名 | ✅ 用你自己的子域名 |
 | **免安装（浏览器）能承载的协议** | HTTP + **WebSocket**（页面里覆盖 `window.WebSocket`） | HTTP + **WebSocket** ✅（做法见 [GOTCHAS §2.1](docs/GOTCHAS.md#21-service-worker-拦不到-websocket透明化要绕一大圈)） |
-| **HttpOnly cookie 认证** | ❌ 转发不了 | ❌ **同样转发不了**——这是 SW 方案的结构性天花板，不是实现缺陷（[§2.12](docs/GOTCHAS.md#212-service-worker-读不到-cookie-头httponly-更是彻底拿不到)） |
+| **HttpOnly cookie 认证** | ❌ 转发不了 | ✅ **可以**——代理自己从响应头的 `Set-Cookie` 维护一份 jar，根本不需要问浏览器（[§2.12](docs/GOTCHAS.md#212-service-worker-读不到-cookie-头httponly-更是彻底拿不到)） |
 | **非 HttpOnly cookie 认证** | 未说明 | ✅ 转发（这一条之前一直是坏的，已修） |
+| **分块 / 压缩响应** | 未说明 | ✅ 自己去分块、自己解压，并主动协商 gzip（[§2.15](docs/GOTCHAS.md#215-sw-合成的响应不会被浏览器解码分块压缩都要自己做)） |
 | **装了 CLI 之后能承载的协议** | **任意 TCP + UDP**（`internal/proxy/tcp.go`、`udp.go`） | 不做——pinhole 没有 CLI 客户端那一端 |
 | Docker / TUI | ✅ Docker sidecar 隔离、实时 TUI | ❌ |
 | 文档 | README + 配置指南 | **36 条踩坑记录**（每条「症状 → 原因 → 修法 → 怎么发现」）+ 实测数据 |
@@ -127,13 +128,14 @@
 **所以诚实的定位是：**
 
 > pinhole **不是一个新机制**。它是在同一个机制上，把**信令做成零服务器**、把**域名所有权交还用户**，
-> 并且**把一路上踩到的 36 个坑逐条写下来**的一个实现。
+> 并且**把一路上踩到的 38 个坑逐条写下来**的一个实现。
 
 **要功能更全的话，BTunnel 的覆盖面更大**（Docker / TCP / UDP / TURN 兜底 / TUI），
 而且它在 **SW↔页面通道**这个细节上的设计比 pinhole 干净。
 但有一点必须分清楚：**它那些"任意协议"的能力，全部在装 CLI 的那条路上。免安装那条路，它同样只有 HTTP + WebSocket。**
-也就是说，如果诉求是"访问者一点东西都不用装"，可选空间本来就这么大——pinhole 并没有比它少一块**能用**的地。
-两边也都撞在同一堵墙上：**免安装这条路转发不了 HttpOnly cookie**（[§2.12](docs/GOTCHAS.md#212-service-worker-读不到-cookie-头httponly-更是彻底拿不到)）。
+也就是说，如果诉求是"访问者一点东西都不用装"，可选空间本来就这么大。
+**HTTP 这一层 pinhole 做得更完整**——分块、压缩、重复响应头、204/304、HttpOnly cookie 都是逐条实测过的
+（见 [§2.15](docs/GOTCHAS.md#215-sw-合成的响应不会被浏览器解码分块压缩都要自己做)、[§2.16](docs/GOTCHAS.md#216-响应方向还有两个坑重复的头和不能有-body-的状态码)）。
 **要弄懂这条路到底有哪些坑，那才是这份仓库存在的理由。**
 
 ---

@@ -1,7 +1,7 @@
 import { MqttSignalingClient } from "./signaling-mqtt";
 import { SignalingClient, type SignalingChannel } from "./signaling";
 import { Tunnel } from "./tunnel";
-import { encodeRequest, splitResponse } from "./http";
+import { encodeRequest, splitResponse, filterHopByHop, headerValue, removeHeader, dechunk, decodeContent } from "./http";
 import { RawWebSocket } from "./ws";
 
 interface ProxyRequest {
@@ -93,6 +93,22 @@ export class PinholeTunnelElement extends HTMLElement {
    * attempted the cookie has already been seen.
    */
   private cookies = new Map<string, string>();
+  /**
+   * Cookies the *target* has set, per hostname.
+   *
+   * This is what makes cookie authentication work at all. The browser will not
+   * part with its own jar for an `HttpOnly` cookie — a Service Worker is script,
+   * and `HttpOnly` means script cannot read it — but the target's `Set-Cookie`
+   * arrives in the response head that *we* parse. So no cooperation from the
+   * browser is required to learn it: we keep our own jar and write `Cookie` on
+   * the way out.
+   *
+   * Deliberately not a cookie engine. There is only ever one host per tunnel, so
+   * no domain matching; no expiry bookkeeping beyond honouring a deletion; no
+   * path matching. Modelling a browser is a large job and the browser doing it
+   * is right there — the one thing it will not do is hand the value over.
+   */
+  private jar = new Map<string, Map<string, string>>();
   /** Live virtual websockets, keyed by the id the shim assigned. */
   private wsSessions = new Map<string, WsSession>();
 
@@ -349,14 +365,23 @@ export class PinholeTunnelElement extends HTMLElement {
     const { id, method, url, headers } = msg;
     const body = new Uint8Array(msg.body);
 
-    // Remember the cookie for later websocket handshakes — see `cookies`.
-    const cookie = headers["cookie"];
-    if (cookie) {
-      try {
-        this.cookies.set(new URL(url).hostname, cookie);
-      } catch {
-        // A malformed url just means no cookie is cached for it.
-      }
+    let hostname = "";
+    try {
+      hostname = new URL(url).hostname;
+    } catch {
+      // A malformed url just means no cookie bookkeeping for it.
+    }
+
+    // Remember whatever the browser was willing to show us, for websocket
+    // handshakes that have no request headers of their own to copy.
+    const fromBrowser = headers["cookie"];
+    if (fromBrowser && hostname) this.cookies.set(hostname, fromBrowser);
+
+    // Add what the target told us to send. This is the half the browser refuses
+    // to do for us — see `jar`.
+    if (hostname) {
+      const merged = this.cookieHeaderFor(hostname, fromBrowser ?? null);
+      if (merged) headers["cookie"] = merged;
     }
 
     try {
@@ -364,17 +389,107 @@ export class PinholeTunnelElement extends HTMLElement {
       const stream = await this.tunnel!.request(reqBytes);
       const { meta, body: bodyStream } = await splitResponse(stream);
 
+      // Fold in anything the target just set, before the next request goes out.
+      if (hostname) this.absorbCookies(hostname, meta.headers);
+
+      // Check the framing *before* filtering: `transfer-encoding` is itself a
+      // hop-by-hop header, so filtering first would remove the very thing that
+      // says the body needs dechunking.
+      const framing = headerValue(meta.headers, "transfer-encoding");
+      let outBody =
+        framing && framing.toLowerCase().includes("chunked")
+          ? dechunk(bodyStream)
+          : bodyStream;
+
+      // Then undo any content coding. Order matters: chunked is the *outer*
+      // framing and must come off first, or the decompressor is fed framing
+      // bytes and dies with a corrupt-stream error.
+      let outHeaders = filterHopByHop(meta.headers);
+      const contentEncoding = headerValue(meta.headers, "content-encoding");
+      if (contentEncoding && contentEncoding.trim().toLowerCase() !== "identity") {
+        const { body, decoded } = decodeContent(outBody, contentEncoding);
+        if (decoded) {
+          outBody = body;
+          outHeaders = removeHeader(outHeaders, "content-encoding");
+          // The length described the compressed bytes.
+          outHeaders = removeHeader(outHeaders, "content-length");
+        }
+      }
+
       this.postToSw({
         type: "proxy-head",
         id,
         status: meta.status,
         statusText: meta.statusText,
-        headers: meta.headers,
+        headers: outHeaders,
       });
-      await this.pump(id, bodyStream);
+      await this.pump(id, outBody);
     } catch (e) {
       this.postToSw({ type: "proxy-error", id, message: String(e) });
     }
+  }
+
+  /**
+   * Record every `Set-Cookie` the target sent.
+   *
+   * Each `Set-Cookie` is its own header and must be read as one cookie. They
+   * cannot be merged and re-split on commas: an `Expires` attribute contains
+   * one (`Wed, 21 Oct 2015 07:28:00 GMT`).
+   */
+  private absorbCookies(hostname: string, headers: Array<[string, string]>): void {
+    for (const [k, v] of headers) {
+      if (k.toLowerCase() !== "set-cookie") continue;
+
+      const semi = v.indexOf(";");
+      const pair = (semi === -1 ? v : v.slice(0, semi)).trim();
+      const eq = pair.indexOf("=");
+      if (eq <= 0) continue;
+      const name = pair.slice(0, eq).trim();
+      if (!name) continue;
+      const value = pair.slice(eq + 1).trim();
+
+      let jar = this.jar.get(hostname);
+      if (!jar) {
+        jar = new Map();
+        this.jar.set(hostname, jar);
+      }
+
+      const attrs = (semi === -1 ? "" : v.slice(semi)).toLowerCase();
+      // An empty value, or Max-Age=0, is how a server deletes a cookie. Storing
+      // the empty string instead would send `name=` forever, which some servers
+      // treat as a present-but-invalid session rather than as no session.
+      if (value === "" || /(?:^|;)\s*max-age\s*=\s*0\s*(?:;|$)/.test(attrs)) {
+        jar.delete(name);
+      } else {
+        jar.set(name, value);
+      }
+    }
+  }
+
+  /**
+   * The `Cookie` header to send for `hostname`.
+   *
+   * Merged by name with the jar winning, because the jar is the target's most
+   * recent word on the subject and the browser's copy may predate it. Without
+   * the merge a request could carry `sid=old; sid=new`, and servers disagree
+   * about which one to believe.
+   */
+  private cookieHeaderFor(hostname: string, fromBrowser: string | null): string | null {
+    const merged = new Map<string, string>();
+
+    if (fromBrowser) {
+      for (const part of fromBrowser.split(";")) {
+        const eq = part.indexOf("=");
+        if (eq > 0) merged.set(part.slice(0, eq).trim(), part.slice(eq + 1).trim());
+      }
+    }
+    const jar = this.jar.get(hostname);
+    if (jar) {
+      for (const [name, value] of jar) merged.set(name, value);
+    }
+
+    if (merged.size === 0) return null;
+    return [...merged].map(([name, value]) => `${name}=${value}`).join("; ");
   }
 
   private async pump(id: string, stream: ReadableStream<Uint8Array>): Promise<void> {
@@ -483,10 +598,14 @@ export class PinholeTunnelElement extends HTMLElement {
     }
 
     const headers: Record<string, string> = {};
-    // Prefer the cookie we saw on real traffic: an HttpOnly session cookie is
-    // invisible to `document.cookie`, and service panels keep their session
-    // there. Fall back to what the shim could read.
-    const cookie = this.cookies.get(hostname) ?? msg.cookie;
+    // A websocket handshake has no request headers of its own to copy, so the
+    // cookie has to be assembled: whatever the shim could read from
+    // `document.cookie` (which never includes an `HttpOnly` one), whatever the
+    // worker saw on earlier requests, and whatever the target told us to send.
+    const cookie = this.cookieHeaderFor(
+      hostname,
+      this.cookies.get(hostname) ?? msg.cookie ?? null,
+    );
     if (cookie) headers["cookie"] = cookie;
     if (navigator.userAgent) headers["user-agent"] = navigator.userAgent;
 

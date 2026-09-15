@@ -113,8 +113,9 @@ The full reasoning is in **[docs/GOTCHAS.en.md § 6](docs/GOTCHAS.en.md)**.
 | **TURN fallback** | ✅ Ships coturn config | ❌ Relies on IPv6, or admits it will not connect |
 | **Custom domain** | ❌ Uses their domain | ✅ Uses your own subdomain |
 | **Protocols over zero-install (browser)** | HTTP + **WebSocket** (it replaces `window.WebSocket` in the page with a virtualised one) | HTTP + **WebSocket** ✅ (how, in [GOTCHAS §2.1](docs/GOTCHAS.en.md)) |
-| **`HttpOnly` cookie auth** | ❌ Cannot be forwarded | ❌ **Also cannot be forwarded** — the structural ceiling of any Service-Worker approach, not an implementation defect ([§2.12](docs/GOTCHAS.en.md)) |
+| **`HttpOnly` cookie auth** | ❌ Cannot be forwarded | ✅ **Supported** — the proxy keeps its own jar from the `Set-Cookie` headers it parses, never asking the browser ([§2.12](docs/GOTCHAS.en.md)) |
 | **Non-`HttpOnly` cookie auth** | Not stated | ✅ Forwarded (this was broken all along and is now fixed) |
+| **Chunked / compressed responses** | Not stated | ✅ Dechunked, decompressed, and gzip is negotiated proactively ([§2.15](docs/GOTCHAS.en.md)) |
 | **Protocols once a CLI is installed** | **Any TCP + UDP** (`internal/proxy/tcp.go`, `udp.go`) | Not offered — pinhole has no CLI-client side |
 | Docker / TUI | ✅ Docker sidecar isolation, live TUI | ❌ |
 | Documentation | README + a configuration guide | **36 documented traps** ("symptom → cause → fix → how we found out") + measured numbers |
@@ -133,13 +134,13 @@ The full reasoning is in **[docs/GOTCHAS.en.md § 6](docs/GOTCHAS.en.md)**.
 **So the honest positioning is:**
 
 > pinhole **is not a new mechanism**. It is an implementation of the same mechanism with **serverless signaling**,
-> **domain ownership handed back to the user**, and **the 36 traps written down one by one**.
+> **domain ownership handed back to the user**, and **the 38 traps written down one by one**.
 
 **If you want a fuller tool, BTunnel covers more ground** (Docker / TCP / UDP / TURN fallback / TUI), and its
 design for the worker↔page channel is cleaner than pinhole's.
 But one distinction matters: **all of its "any protocol" capability lives on the path where you install the CLI. On the zero-install path it too has only HTTP + WebSocket.**
-So if the requirement is "the visitor installs nothing", the available room is simply this small — pinhole is not missing a piece of *usable* ground that BTunnel has.
-Both also hit the same wall: **the zero-install path cannot forward an `HttpOnly` cookie** ([§2.12](docs/GOTCHAS.en.md)).
+So if the requirement is "the visitor installs nothing", the available room is simply this small.
+**At the HTTP layer pinhole goes further** — chunking, compression, repeated response headers, 204/304 and `HttpOnly` cookies are each covered by a measured test ([§2.15](docs/GOTCHAS.en.md), [§2.16](docs/GOTCHAS.en.md)).
 **If you want to understand which traps this road actually has, that is the reason this repository exists.**
 
 ---

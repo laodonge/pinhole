@@ -15,7 +15,11 @@ interface ProxyHeadMessage {
   id: string;
   status: number;
   statusText: string;
-  headers: Record<string, string>;
+  /**
+   * Pairs rather than an object, so repeated headers survive. `Set-Cookie` is
+   * routinely sent more than once and cannot be re-split after being joined.
+   */
+  headers: Array<[string, string]>;
 }
 
 interface ProxyDataMessage {
@@ -218,8 +222,8 @@ function concat(chunks: Uint8Array[]): Uint8Array {
   return out;
 }
 
-function isHtml(headers: Record<string, string>): boolean {
-  const type = headers["content-type"] ?? "";
+function isHtml(headers: Headers): boolean {
+  const type = headers.get("content-type") ?? "";
   return type.toLowerCase().includes("text/html");
 }
 
@@ -397,18 +401,28 @@ sw.addEventListener("message", (event: ExtendableMessageEvent) => {
       const entry = pending.get(msg.id);
       if (!entry) break;
 
+      // `append` rather than `set`: repeated headers have to stay repeated.
+      const headers = new Headers();
+      for (const [k, v] of msg.headers) headers.append(k, v);
+
       // Rewrite the document only when we can actually read it. A compressed
       // body would have to be inflated first, and injecting into bytes we
       // cannot parse would corrupt the page — worse than not injecting at all.
       // `accept-encoding` is dropped for navigations so this is the normal case.
-      let headers = msg.headers;
-      if (entry.inject && isHtml(headers) && !headers["content-encoding"]) {
+      if (entry.inject && isHtml(headers) && !headers.get("content-encoding")) {
         entry.injector = makeInjector(shimTag());
-        headers = { ...headers };
         // The body is about to change length, and it is now streamed.
-        delete headers["content-length"];
-        delete headers["content-encoding"];
+        headers.delete("content-length");
+        headers.delete("content-encoding");
       }
+
+      // Statuses that are defined to carry no body. `new Response(stream, …)`
+      // with one of these throws a TypeError, and because the throw happens
+      // inside the worker's message handler the pending promise is never
+      // settled — the page's fetch then hangs forever with nothing in the
+      // console. 204 is common enough (DELETE, PUT, save endpoints) that this
+      // is worth handling explicitly rather than hoping.
+      const nullBody = msg.status === 204 || msg.status === 205 || msg.status === 304;
 
       const stream = new ReadableStream<Uint8Array>({
         start(controller) {
@@ -429,7 +443,7 @@ sw.addEventListener("message", (event: ExtendableMessageEvent) => {
         },
       });
       entry.resolve(
-        new Response(stream, {
+        new Response(nullBody ? null : stream, {
           status: msg.status,
           statusText: msg.statusText,
           headers: withCors(headers, entry.origin),
@@ -478,7 +492,7 @@ sw.addEventListener("message", (event: ExtendableMessageEvent) => {
           new Response(msg.message, {
             status: 502,
             headers: withCors(
-              { "content-type": "text/plain; charset=utf-8" },
+              new Headers({ "content-type": "text/plain; charset=utf-8" }),
               entry.origin,
             ),
           }),
@@ -566,20 +580,25 @@ async function proxy(event: FetchEvent): Promise<Response> {
     headers[key] = value;
   });
   // See cookiesFor: the cookie is not in `request.headers`, so it has to be
-  // fetched from the cookie jar or the target never authenticates.
-  // See cookiesFor: the cookie is not in `request.headers`, so it has to be
   // fetched from the cookie jar or the target never authenticates. Only
   // non-HttpOnly cookies are visible here — see the note in GOTCHAS.
   if (!headers["cookie"]) {
     const cookie = await cookiesFor(request.url);
     if (cookie) headers["cookie"] = cookie;
   }
+
+  // `Accept-Encoding` is a forbidden header name too, so the browser's own value
+  // never reaches us and the origin would never compress anything: every HTML,
+  // CSS, JS and JSON response crosses the tunnel at full size. We ask for the
+  // two encodings the platform can undo, and the shell undoes them.
+  //
+  // Not for navigations: the document is rewritten to inject the shim, which is
+  // impossible through gzip. Not for Range requests either, where per-range
+  // compression would make `Content-Range` meaningless.
   if (inject) {
-    // Ask for the document uncompressed. Rewriting HTML requires being able to
-    // read it, and the shim cannot be injected into gzip. This costs bandwidth
-    // on markup only — the payloads this project exists for are already
-    // compressed and are not navigations.
     delete headers["accept-encoding"];
+  } else if (!headers["range"] && typeof DecompressionStream !== "undefined") {
+    headers["accept-encoding"] = "gzip, deflate";
   }
 
   const client = await tunnelFor(event, new URL(request.url).hostname);
@@ -587,7 +606,7 @@ async function proxy(event: FetchEvent): Promise<Response> {
     return new Response("no tunnel for this hostname", {
       status: 503,
       headers: withCors(
-        { "content-type": "text/plain; charset=utf-8" },
+        new Headers({ "content-type": "text/plain; charset=utf-8" }),
         origin,
       ),
     });
@@ -625,17 +644,12 @@ async function proxy(event: FetchEvent): Promise<Response> {
  * the synthesised response outright, and without the expose list a Range-based
  * downloader cannot read `Content-Range` / `Accept-Ranges`.
  */
-function withCors(
-  headers: Record<string, string>,
-  origin: string | null,
-): Record<string, string> {
+function withCors(headers: Headers, origin: string | null): Headers {
   if (!origin) return headers;
-  const vary = headers["vary"];
-  return {
-    ...headers,
-    "access-control-allow-origin": origin,
-    "access-control-allow-credentials": "true",
-    "access-control-expose-headers": EXPOSE_HEADERS,
-    vary: vary ? `${vary}, Origin` : "Origin",
-  };
+  const vary = headers.get("vary");
+  headers.set("access-control-allow-origin", origin);
+  headers.set("access-control-allow-credentials", "true");
+  headers.set("access-control-expose-headers", EXPOSE_HEADERS);
+  headers.set("vary", vary ? `${vary}, Origin` : "Origin");
+  return headers;
 }

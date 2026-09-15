@@ -642,12 +642,17 @@ After the fix, non-`HttpOnly` cookies work. But **`HttpOnly` is a hard limit**:
 |---|---|
 | Bypassing the worker, on the browser's own network stack | `cookie: psession=…; plainprobe=visible` ← both present |
 | `cookieStore.getAll()` inside the worker | `n=1`, **only `plainprobe`** |
-| A request through the tunnel | only `plainprobe` |
 
-`HttpOnly` means "script cannot read it", and **a Service Worker is script**. Therefore:
+`HttpOnly` means "script cannot read it", and **a Service Worker is script**. BTunnel uses the same mechanism (its `sw.js` likewise rebuilds the request from `request.headers`), so it has exactly the same limit.
 
-> **No Service-Worker-based proxy can ever forward an `HttpOnly` cookie.**
-> This is not an implementation defect; it is the ceiling of this approach. BTunnel uses the same mechanism (its `sw.js` likewise rebuilds the request from `request.headers`), so it has exactly the same limit.
+**But the limit binds only the request direction.** The key observation: **the browser will not give us its cookie jar, but a `Set-Cookie` the target sends arrives in a response head — and the response head is exactly what the proxy already parses.** So the fix needs nothing else in the chain:
+
+```
+Set-Cookie in a response head  →  the proxy keeps its own jar
+the next request               →  the proxy writes Cookie itself
+```
+
+**The agent is not involved at all, and never looks at a byte.** The earlier plan to have it read `Set-Cookie` turned out to be unnecessary.
 
 **For 1Panel specifically**, the session cookie is hard-coded `HttpOnly`:
 
@@ -657,7 +662,16 @@ c.SetCookie(constant.SessionName, sessionID, ttlSeconds, "/", "", secure, true)
 //                                                                        ^^^^ httpOnly
 ```
 
-So **1Panel's terminal cannot authenticate through pinhole.** The only remaining route is to change layers: the agent is a raw byte pipe and **can see `Set-Cookie`**, so it could remember the value and attach `Cookie` to later requests — never asking the browser for the cookie at all. The cost is that the agent stops being a pure pipe and starts reading HTTP headers.
+That path works now, on both HTTP and WebSocket — measured, the websocket handshake carries
+`plainprobe=visible; tunnel_plain=visible; tunnel_secret=hidden`, **the `HttpOnly` one included**.
+
+**The one remaining blind spot**: a session that was already established *before* pinhole was ever
+used. That `Set-Cookie` never crossed the tunnel, so the proxy's jar does not have it and the browser
+will not say — **you have to log in again through pinhole**.
+
+> **Lesson**: "script cannot read a value" and "a proxy cannot obtain that value" are two different
+> statements. Ask "does this value pass through me from the other direction?" before reaching for a
+> lower layer.
 
 ---
 
@@ -693,6 +707,57 @@ So **1Panel's terminal cannot authenticate through pinhole.** The only remaining
 | **CSP** | An inline script is blocked outright by `script-src` | Use an **external** script, and pass the served domains in the script URL's **query string** — no inline script anywhere |
 
 **Also, do not buffer the whole HTML document before injecting**: hold back only up to the insertion point and pass everything after it straight through. Full buffering is what most proxies do, and it is precisely what makes first paint slow.
+
+---
+
+### 2.15 A worker-synthesised response is never decoded by the browser — chunking and compression are yours to undo
+
+| | |
+|---|---|
+| **Symptom** | Page text contains things like `6 alpha- 6 bravo- 7 charlie 0`; or the body is binary garbage; or `JSON.parse` reports `Unexpected non-whitespace character after JSON` |
+| **Cause** | The proxy hands **bytes** to `new Response(stream, {headers})`. Once the body is supplied bytes, the browser never looks at `Transfer-Encoding` or `Content-Encoding` — that is what the network stack does for a *real* response |
+| **Fix** | Implement both layers yourself: dechunk first (outer), then decompress (inner) |
+
+**The real-world impact is easy to underestimate**: a server only sends `Content-Length` when it knew the whole body up front, so **almost every dynamic response is chunked**. Without this fix, dynamic pages are entirely broken — and a static test server that always sets `Content-Length` cannot reveal it.
+
+**There is a mirror-image trap on the way out: `Accept-Encoding` is also a forbidden header.** The worker cannot see the browser's value, so the target **never compresses anything** — HTML, CSS, JS and JSON all cross the tunnel at full size, burning uplink for nothing. So:
+
+| Direction | What to do |
+|---|---|
+| Request | The proxy **declares it itself**: `Accept-Encoding: gzip, deflate` — only what the platform can actually undo. Brotli is not, so it is not offered |
+| Response | Decompress per `Content-Encoding`, then **delete that header** and `Content-Length` (which described the compressed length) |
+
+Two exceptions are mandatory:
+
+- **Navigations do not ask for compression** — the HTML has to be rewritten to inject the shim, and that is impossible through gzip
+- **Requests with `Range` do not ask either** — per-range compression would make `Content-Range` meaningless
+
+**The order cannot be reversed**: chunked is the **outer** framing and must come off first, or the decompressor is fed framing bytes and dies with a corrupt-stream error.
+
+Measured, in one conformance run:
+
+```
+ok   chunked body
+ok   chunked+gzip body
+ok   gzip body
+ok   range content-range
+```
+
+---
+
+### 2.16 Two more on the response path: repeated headers, and statuses that cannot have a body
+
+| | |
+|---|---|
+| **Symptom** | ① Two `Set-Cookie` headers in one response collapse into one; ② a 204 makes `fetch` **hang forever** with nothing at all in the console |
+| **Cause** | ① The headers were put into a `Record<string,string>`, so a repeated name overwrites; ② `new Response(stream, {status: 204})` **throws a TypeError**, and the throw happens inside the worker's message handler, so the pending promise is never settled |
+| **Fix** | ① Pass headers as an **array of pairs** and use `Headers.append`; ② pass `null` as the body for 204/205/304 |
+
+**Why ① cannot be solved by joining on commas**: `Set-Cookie` cannot be joined and re-split — `Expires=Wed, 21 Oct 2015 07:28:00 GMT` contains a comma. One header, one cookie.
+
+**Why ② is so hard to find**: the fetch hangs, there is no exception and no log, and it looks like the network stalled. And 204 is common in practice (DELETE, PUT, every "save" endpoint).
+
+> **Lesson**: **the moment a `Response` does not come from the network stack, none of HTTP's automatic behaviour exists.** Chunking, decompression, repeated headers, empty-body semantics — every one of them is yours.
 
 ---
 

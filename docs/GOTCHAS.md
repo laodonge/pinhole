@@ -635,18 +635,25 @@ setInterval(() => {
 
 **这一条在此之前一直是坏的。** 不是"HttpOnly 有问题"——而是**连普通 cookie 都没转发过**。之前没暴露，是因为 AList / 静态网盘那类场景用的是 URL 里的 token，不靠 cookie。
 
-修完之后，非 HttpOnly 的 cookie 正常了。但 **HttpOnly 是硬限制**：
+修完之后，非 HttpOnly 的 cookie 正常了。
+
+**但 HttpOnly 光靠浏览器是拿不到的**：
 
 | 观察点 | 结果 |
 |---|---|
 | 绕过 SW、走浏览器自己的网络栈 | `cookie: psession=…; plainprobe=visible` ← 两个都在 |
 | SW 里 `cookieStore.getAll()` | `n=1`，**只有 `plainprobe`** |
-| 经隧道的请求 | 只有 `plainprobe` |
 
-`HttpOnly` 的定义就是"脚本读不到"，而 **Service Worker 也是脚本**。所以：
+`HttpOnly` 的定义就是"脚本读不到"，而 **Service Worker 也是脚本**。BTunnel 用的是同一套机制（它的 `sw.js` 同样从 `request.headers` 重建请求），所以它有完全一样的限制。
 
-> **任何基于 Service Worker 的代理都不可能转发 HttpOnly cookie。**
-> 这不是实现缺陷，是这条路的天花板。BTunnel 用的是同一套机制（它的 `sw.js` 同样从 `request.headers` 重建请求），所以它有完全一样的限制。
+**不过这个限制只卡在"请求方向"。** 关键在于：**浏览器不肯把它的 cookie jar 给我们，但目标下发的 `Set-Cookie` 就在响应头里——而响应头正是代理自己解析的东西。** 于是修法根本不需要别的组件参与：
+
+```
+响应头里有 Set-Cookie  →  代理自己存一份 jar
+下一次请求  →  代理自己把 Cookie 写回去
+```
+
+**agent 全程不参与，一个字节都不用看。** 也就是说之前设想的"让 agent 读 Set-Cookie"是多余的。
 
 **具体到 1Panel**：它的会话 cookie 写死了 HttpOnly——
 
@@ -656,7 +663,13 @@ c.SetCookie(constant.SessionName, sessionID, ttlSeconds, "/", "", secure, true)
 //                                                                        ^^^^ httpOnly
 ```
 
-所以 **1Panel 的终端无法通过 pinhole 认证**。要解决只能换一层：agent 是原始字节管道，它**看得见 `Set-Cookie`**，可以由它记住并在后续请求里补 `Cookie`——那样根本不需要问浏览器要 cookie。代价是 agent 从"纯管道"变成"会看一眼 HTTP 头"。
+现在这条链路走通了，HTTP 和 WebSocket 两边都带得上（实测 WS 握手里拿到的是
+`plainprobe=visible; tunnel_plain=visible; tunnel_secret=hidden`，**HttpOnly 那条在里面**）。
+
+**唯一还剩下的死角**：**在用 pinhole 之前就已经建立好的会话**。那次 `Set-Cookie` 从没经过隧道，代理的 jar 里没有，浏览器又不肯说——所以**得在 pinhole 里重新登录一次**。
+
+> 教训：**"脚本读不到某个值"和"这个值无法被代理"是两件事。** 先问一句"这个值会不会从另一个方向经过我"，
+> 再决定要不要去动底层组件。
 
 ---
 
@@ -692,6 +705,57 @@ c.SetCookie(constant.SessionName, sessionID, ttlSeconds, "/", "", secure, true)
 | **CSP** | 内联脚本被 `script-src` 直接拦掉 | 用**外链**脚本，并把服务域名塞进**脚本 URL 的查询串**，全程不出现内联脚本 |
 
 **另外不要整包缓冲 HTML 再注入**：只缓冲到插入点为止，之后原样透传。整包缓冲是大多数代理的做法，也正是让首屏变慢的原因。
+
+---
+
+### 2.15 SW 合成的响应不会被浏览器解码——分块、压缩都要自己做
+
+| | |
+|---|---|
+| **症状** | 网页正文里出现 `6 alpha- 6 bravo- 7 charlie 0` 这种东西；或者拿到一堆二进制乱码；或者 `JSON.parse` 报 `Unexpected non-whitespace character after JSON` |
+| **原因** | 代理是把**字节**交给 `new Response(stream, {headers})`。既然 body 是现成的字节，浏览器**不会**再去看 `Transfer-Encoding` 或 `Content-Encoding`——那是网络栈对**真实响应**做的事 |
+| **修法** | 两层解码自己实现：先去分块（外层），再解压缩（内层） |
+
+**现实影响被严重低估**：服务器只在"事先知道整个 body"时才发 `Content-Length`，所以**所有动态响应几乎都是分块的**。也就是说这一条不修，动态页面全废——而用显式 `Content-Length` 的静态测试服测是测不出来的。
+
+**还有一个反向的坑：`Accept-Encoding` 也是禁止头。** 浏览器自己的值 SW 看不到，于是目标**从不压缩**——HTML/CSS/JS/JSON 全部按原样过隧道，白白吃上行带宽。所以：
+
+| 方向 | 做法 |
+|---|---|
+| 请求 | 代理**自己**声明 `Accept-Encoding: gzip, deflate`（只声明平台真能解的；Brotli 不行，所以不写） |
+| 响应 | 按 `Content-Encoding` 解压，然后**删掉这个头**和 `Content-Length`（它描述的是压缩后的长度） |
+
+两个例外必须排除：
+
+- **导航请求不声明压缩**——HTML 要被改写以注入垫片，压缩了就没法改
+- **带 `Range` 的请求不声明压缩**——按段压缩会让 `Content-Range` 失去意义
+
+**顺序不能反**：chunked 是**外层**框架，必须先剥掉，否则解压器吃到的是框架字节，直接报 corrupt stream。
+
+实测（同一轮一致性用例）：
+
+```
+ok   chunked body
+ok   chunked+gzip body
+ok   gzip body
+ok   range content-range
+```
+
+---
+
+### 2.16 响应方向还有两个坑：重复的头，和不能有 body 的状态码
+
+| | |
+|---|---|
+| **症状** | ① 同一个响应里的两个 `Set-Cookie` 只剩一个；② 遇到 204 时 `fetch` **永久挂起**，控制台什么都没有 |
+| **原因** | ① 头被塞进 `Record<string,string>`，重名的直接覆盖；② `new Response(stream, {status: 204})` **抛 TypeError**，而抛出点在 SW 的消息处理器里，那个 pending promise 永远不会 settle |
+| **修法** | ① 头用**二元组数组**传递，SW 那边用 `Headers.append`；② 204/205/304 传 `null` 作 body |
+
+**①为什么不能用逗号拼接**：`Set-Cookie` 不能被 join 再 split——`Expires=Wed, 21 Oct 2015 07:28:00 GMT` 里面就有逗号。所以必须是"一条一个"。
+
+**②为什么特别难查**：`fetch` 挂起、没有异常、没有日志，看起来像"网络卡了"。而 204 在现实里很常见（DELETE、PUT、各种保存接口）。
+
+> 教训：**只要不是网络栈给你的 Response，HTTP 的"自动行为"就都不存在了。** 分块、解压、重复头、空 body 语义，一条一条都得自己来。
 
 ---
 
