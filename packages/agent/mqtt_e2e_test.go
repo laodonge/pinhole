@@ -89,7 +89,7 @@ func TestMQTTEndToEnd(t *testing.T) {
 	//
 	// The ICE announcement is covered by unit tests in announce_test.go, where
 	// it can be checked without a real connection.
-	agent := NewAgent(target, "")
+	agent := NewAgent(target, plainDialer(target), "", "")
 	go func() {
 		if err := agent.Run(agentSig); err != nil {
 			t.Logf("agent stopped: %v", err)

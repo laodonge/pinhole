@@ -18,8 +18,10 @@
  */
 
 import http from "node:http";
+import https from "node:https";
 import zlib from "node:zlib";
 import { readFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,6 +32,15 @@ const dist = path.resolve(here, "../packages/bootstrap/dist");
 
 const SHELL_PORT = Number(process.env.SHELL_PORT ?? 8090);
 const MOCK_PORT = Number(process.env.MOCK_PORT ?? 5250);
+/**
+ * The same mock again, behind TLS.
+ *
+ * Reached with `-target 127.0.0.1:5251 -target-tls insecure`, which is how the
+ * whole conformance suite gets re-run through a TLS target without touching a
+ * single assertion: the browser side cannot tell the difference, which is
+ * exactly the point of putting the TLS in the agent.
+ */
+const MOCK_TLS_PORT = Number(process.env.MOCK_TLS_PORT ?? 5251);
 const SESSION_COOKIE = "psession=e2e-httponly-secret";
 
 /** What the page compares against; the server owns the truth. */
@@ -267,8 +278,11 @@ const LARGE_BYTES = (() => {
 })();
 const LARGE_SHA = createHash("sha256").update(LARGE_BYTES).digest("hex").slice(0, 16);
 
-const mock = http.createServer((req, res) => {
-  void httpApi(req, res, new URL(req.url, `http://127.0.0.1:${MOCK_PORT}`)).catch(() => {
+// One handler, two servers. Anything that works over plain HTTP has to work
+// identically over TLS, so the assertions are shared rather than duplicated.
+function handleMock(req, res) {
+  const port = req.socket.localPort ?? MOCK_PORT;
+  void httpApi(req, res, new URL(req.url, `http://127.0.0.1:${port}`)).catch(() => {
     try {
       res.writeHead(500);
       res.end("mock error");
@@ -276,11 +290,19 @@ const mock = http.createServer((req, res) => {
       // Already sent.
     }
   });
-});
+}
+
+const mock = http.createServer(handleMock);
+
+const tlsFixture = {
+  key: readFileSync(path.resolve(here, "testdata/tls-key.pem")),
+  cert: readFileSync(path.resolve(here, "testdata/tls-cert.pem")),
+};
+const mockTLS = https.createServer(tlsFixture, handleMock);
 
 const wss = new WebSocketServer({ noServer: true });
 
-mock.on("upgrade", (req, socket, head) => {
+function handleUpgrade(req, socket, head) {
   const cookie = req.headers.cookie ?? "";
   const record0 = {
     cookie,
@@ -338,7 +360,10 @@ mock.on("upgrade", (req, socket, head) => {
     }, 1500);
     ws.on("close", () => clearInterval(timer));
   });
-});
+}
+
+mock.on("upgrade", handleUpgrade);
+mockTLS.on("upgrade", handleUpgrade);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The page: runs the conformance checks from inside the proxied document
@@ -632,7 +657,13 @@ const shell = http.createServer(async (req, res) => {
 mock.listen(MOCK_PORT, "127.0.0.1", () => {
   console.log(`mock service       http://127.0.0.1:${MOCK_PORT}`);
 });
+mockTLS.listen(MOCK_TLS_PORT, "127.0.0.1", () => {
+  console.log(`mock service (TLS) https://127.0.0.1:${MOCK_TLS_PORT}`);
+});
 shell.listen(SHELL_PORT, "127.0.0.1", () => {
   console.log(`shell (dist)       http://localhost:${SHELL_PORT}`);
   console.log(`stats              http://localhost:${SHELL_PORT}/__stats`);
+  console.log("");
+  console.log("plain target:  -target 127.0.0.1:" + MOCK_PORT);
+  console.log("TLS target:    -target 127.0.0.1:" + MOCK_TLS_PORT + " -target-tls insecure");
 });

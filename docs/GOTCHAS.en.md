@@ -761,6 +761,58 @@ ok   range content-range
 
 ---
 
+### 2.17 When the target is TLS-only, the failure looks like the network stalling
+
+| | |
+|---|---|
+| **Symptom** | The tunnel connects, but every request returns 502 with `invalid HTTP response: no header terminator` — or the browser ends up in a redirect loop |
+| **Cause** | **The agent-to-target leg is plaintext by default.** Feeding plaintext HTTP into a TLS listener gets the connection dropped, and an `\r\n\r\n` will of course never appear in those bytes |
+| **Fix** | `-target-tls insecure`, or `verify` with `-target-tls-ca` |
+
+**Be clear about what this switch is for**, because it is easily mistaken for a security feature:
+
+The browser-to-agent leg is encrypted by DTLS 1.3 because WebRTC requires it. So this switch is about
+**interoperability** — getting a TLS-only target to talk to you — and **not** about adding secrecy to a
+path DTLS already covers. "Who is the peer, really" belongs to the application (accounts, tokens), not
+to the transport.
+
+| Value | Meaning | When |
+|---|---|---|
+| `off` (default) | Plaintext | The target speaks plain HTTP (behind a local reverse proxy — the common case) |
+| `insecure` | TLS, certificate not verified | The target is self-signed. **This is the default that fits the purpose, not a compromise** |
+| `verify` | TLS with verification (system roots + `-target-tls-ca`) | When you also want "wrong service" to be noticed |
+
+**What makes this trap hard is the error it produces.** Two server shapes, two equally uninformative results:
+
+| Target behaviour | What the browser sees |
+|---|---|
+| Answers with a TLS alert (nginx / OpenResty) | 502 `no header terminator` |
+| Just hangs up (Go's `tls.Listen`) | Also a 502, only **zero bytes were received** |
+| Force-redirects to https with a 301 | A **redirect loop** — the `https://` it redirects to is the same origin as the shell, so the worker intercepts it again and it lands back on the TLS port |
+
+So the fix has two halves, and **both are needed**:
+
+1. **Make it work**: `-target-tls`, one flag.
+2. **Make the misconfiguration legible**: recognise a TLS record (`0x16`/`0x15`/`0x14` plus `0x03`) and
+   recognise "closed with zero bytes", then say what to *do* instead of "no header terminator". The
+   page shows it directly:
+
+```
+the target accepted the connection but sent nothing —
+if it only speaks TLS, restart the agent with `-target-tls insecure`
+```
+
+> **Lesson**: **"connected but said nothing" is itself a diagnostic signal.** Zero bytes and "a pile of
+> bytes that will not parse" are different diseases; reported apart, the user knows what to change.
+> Each hint is logged once per process — per request would flood the log, and a hint nobody reads is
+> not a hint.
+
+Measured: the whole conformance suite (22 HTTP checks plus 5 WebSocket checks) re-run against a TLS
+target passes unchanged — not one line changed on the browser side, because the TLS lives entirely in
+the agent.
+
+---
+
 ## 3. Signalling
 
 ### 3.1 MQTT over WebSocket must declare the `mqtt` subprotocol

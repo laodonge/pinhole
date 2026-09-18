@@ -57,6 +57,12 @@ func parseFlags(args []string) (*flagOverrides, error) {
 	fs.StringVar(&ov.values.Token, "token", "", "optional auth token (ws signaling)")
 	fs.StringVar(&ov.values.Target, "target", "",
 		"local TCP target to expose, e.g. 127.0.0.1:5244")
+	fs.StringVar(&ov.values.TargetTLS, "target-tls", "",
+		`encrypt the hop to the target: "off" (default), "insecure", or "verify"`)
+	fs.StringVar(&ov.values.TargetTLSCA, "target-tls-ca", "",
+		"PEM file of extra roots to trust (with -target-tls verify)")
+	fs.StringVar(&ov.values.TargetTLSSNI, "target-tls-sni", "",
+		"server name to send as SNI and verify against (default: the target host)")
 	fs.StringVar(&ov.values.STUN, "stun", "",
 		"STUN server; pass an empty string to disable it (fine on a LAN)")
 	fs.StringVar(&ov.values.Listen, "listen", "", "listen address for mode=signal")
@@ -93,6 +99,29 @@ type agentConfig struct {
 
 	// Target is the local TCP service to expose, e.g. "127.0.0.1:5244".
 	Target string `json:"target"`
+
+	// TargetTLS encrypts the hop to the target. One of:
+	//   ""/"off"   plaintext (the default)
+	//   "insecure" TLS, certificate not verified
+	//   "verify"   TLS, certificate verified against the system roots
+	//
+	// What this is for: reaching a target that only speaks TLS. The tunnel from
+	// the browser is already DTLS-encrypted, so this adds no secrecy to the path
+	// as a whole — it makes a TLS-only listener willing to talk. "insecure" is
+	// therefore a reasonable default rather than a compromise: the wire is
+	// encrypted, which is the point, and who the peer is is the application's
+	// business, not this layer's.
+	TargetTLS string `json:"targetTls"`
+
+	// TargetTLSCA is a PEM file of roots to trust, for a self-signed certificate
+	// you control. Only meaningful with TargetTLS == "verify".
+	TargetTLSCA string `json:"targetTlsCA"`
+
+	// TargetTLSSNI overrides the name sent as SNI and verified against the
+	// certificate. Needed when the certificate is issued for a domain while the
+	// target is reached as 127.0.0.1 — and, in insecure mode, when a server
+	// picks its certificate by SNI.
+	TargetTLSSNI string `json:"targetTlsSNI"`
 
 	// STUN server. Empty disables it — fine on a LAN and in tests.
 	STUN string `json:"stun"`
@@ -157,6 +186,15 @@ func (ov *flagOverrides) apply(cfg *agentConfig) {
 	if ov.set["target"] {
 		cfg.Target = ov.values.Target
 	}
+	if ov.set["target-tls"] {
+		cfg.TargetTLS = ov.values.TargetTLS
+	}
+	if ov.set["target-tls-ca"] {
+		cfg.TargetTLSCA = ov.values.TargetTLSCA
+	}
+	if ov.set["target-tls-sni"] {
+		cfg.TargetTLSSNI = ov.values.TargetTLSSNI
+	}
 	if ov.set["stun"] {
 		cfg.STUN = ov.values.STUN
 	}
@@ -186,6 +224,15 @@ func (c agentConfig) validate() error {
 	}
 	if c.Target == "" {
 		return errors.New("no target: set \"target\" in agent.json or pass -target")
+	}
+	if !validTargetTLSMode(c.TargetTLS) {
+		return fmt.Errorf("unknown -target-tls %q (want \"off\", \"insecure\", or \"verify\")", c.TargetTLS)
+	}
+	if c.TargetTLSCA != "" && c.TargetTLS != targetTLSVerify {
+		return errors.New("-target-tls-ca only applies with -target-tls verify")
+	}
+	if c.TargetTLSSNI != "" && (c.TargetTLS == "" || c.TargetTLS == "off") {
+		return errors.New("-target-tls-sni only applies with -target-tls set")
 	}
 
 	kind := resolveSignalKind(c.SignalKind, c.Signal)

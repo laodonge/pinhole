@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"net"
 	"os"
 	"strings"
 	"time"
@@ -22,8 +23,15 @@ func main() {
 	}
 	overrides.apply(&cfg)
 
+	target := cfg.Target
+	if cfg.TargetTLS != "" && cfg.TargetTLS != "off" {
+		// Worth stating at startup: with this on, a certificate problem looks
+		// completely different from with it off, and the log is where somebody
+		// will look.
+		target += " (tls:" + cfg.TargetTLS + ")"
+	}
 	log.Printf("config: mode=%s signal=%s room=%s target=%s",
-		orDefault(cfg.Mode, "agent"), cfg.Signal, cfg.Room, cfg.Target)
+		orDefault(cfg.Mode, "agent"), cfg.Signal, cfg.Room, target)
 
 	if err := cfg.validate(); err != nil {
 		log.Fatalf("invalid configuration: %v", err)
@@ -52,7 +60,12 @@ func main() {
 		return
 	}
 
-	runWithReconnect(cfg)
+	targetDial, err := newTargetDialer(cfg.Target, cfg.TargetTLS, cfg.TargetTLSCA, cfg.TargetTLSSNI)
+	if err != nil {
+		log.Fatalf("target TLS: %v", err)
+	}
+
+	runWithReconnect(cfg, targetDial)
 }
 
 // runWithReconnect keeps the agent alive across signaling failures.
@@ -62,7 +75,7 @@ func main() {
 // means the service stays dark until a human notices and restarts it, which for
 // a long-running agent is the difference between "works" and "works until it
 // doesn't".
-func runWithReconnect(cfg agentConfig) {
+func runWithReconnect(cfg agentConfig, targetDial func() (net.Conn, error)) {
 	const healthyAfter = time.Minute
 
 	backoff := time.Second
@@ -76,7 +89,7 @@ func runWithReconnect(cfg agentConfig) {
 		}
 
 		startedAt := time.Now()
-		runErr := NewAgent(cfg.Target, cfg.STUN).Run(sig)
+		runErr := NewAgent(cfg.Target, targetDial, cfg.TargetTLS, cfg.STUN).Run(sig)
 		sig.Close()
 
 		if runErr != nil {

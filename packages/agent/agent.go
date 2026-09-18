@@ -14,10 +14,14 @@ import (
 
 type Agent struct {
 	target string
-	stun   string
-	signal SignalingChannel
-	mu     sync.Mutex
-	peers  map[string]*Peer
+	// dial reaches the target. A function rather than a fixed net.Dial so that
+	// -target-tls selects a TLS dial without every downstream caller knowing.
+	dial    func() (net.Conn, error)
+	tlsMode string
+	stun    string
+	signal  SignalingChannel
+	mu      sync.Mutex
+	peers   map[string]*Peer
 }
 
 type Peer struct {
@@ -27,8 +31,12 @@ type Peer struct {
 }
 
 type Tunnel struct {
-	target string
-	once   sync.Once
+	// dial opens one connection to the target for this data channel.
+	dial func() (net.Conn, error)
+	// target is kept only for log messages.
+	target  string
+	tlsMode string
+	once    sync.Once
 	// done is closed when the tunnel shuts down, so a sender blocked on
 	// backpressure can bail out instead of waiting for a callback that will
 	// never arrive.
@@ -44,6 +52,9 @@ type Tunnel struct {
 	conn    net.Conn
 	ready   bool
 	pending [][]byte
+	// sawTLS is set once the target's first bytes have been inspected, so the
+	// hint is logged once rather than per read.
+	sawTLS bool
 }
 
 // Data channel tuning.
@@ -64,11 +75,15 @@ const (
 	bufferedAmountLowThreshold = 256 * 1024
 )
 
-func NewAgent(target, stun string) *Agent {
+// NewAgent builds the agent. `dial` reaches the target; see newTargetDialer for
+// how -target-tls turns that into a TLS connection.
+func NewAgent(target string, dial func() (net.Conn, error), tlsMode, stun string) *Agent {
 	return &Agent{
-		target: target,
-		stun:   stun,
-		peers:  make(map[string]*Peer),
+		target:  target,
+		dial:    dial,
+		tlsMode: tlsMode,
+		stun:    stun,
+		peers:   make(map[string]*Peer),
 	}
 }
 
@@ -298,7 +313,12 @@ func (a *Agent) removePeer(id string) {
 }
 
 func (a *Agent) handleDataChannel(dc *webrtc.DataChannel) {
-	tunnel := &Tunnel{target: a.target, done: make(chan struct{})}
+	tunnel := &Tunnel{
+		dial:    a.dial,
+		target:  a.target,
+		tlsMode: a.tlsMode,
+		done:    make(chan struct{}),
+	}
 	dc.OnOpen(func() { tunnel.start(dc) })
 	dc.OnClose(func() { tunnel.close() })
 }
@@ -338,7 +358,7 @@ func (t *Tunnel) start(dc *webrtc.DataChannel) {
 	go func() {
 		defer dc.Close()
 
-		conn, err := net.Dial("tcp", t.target)
+		conn, err := t.dial()
 		if err != nil {
 			log.Printf("dial target %s: %v", t.target, err)
 			return
@@ -363,9 +383,12 @@ func (t *Tunnel) start(dc *webrtc.DataChannel) {
 		// size or Send fails on a large read.
 		bufSize := 4 * 1024
 		buf := make([]byte, bufSize)
+		total := 0
 		for {
 			n, err := conn.Read(buf)
 			if n > 0 {
+				total += n
+				t.noteTargetProtocol(buf[:n])
 				if !sendChunked(dc, buf[:n], sendMore, t.done) {
 					return
 				}
@@ -373,6 +396,11 @@ func (t *Tunnel) start(dc *webrtc.DataChannel) {
 			if err != nil {
 				if err != io.EOF {
 					log.Printf("read target: %v", err)
+				}
+				// A target that accepted the connection and said nothing at all
+				// is the TLS-listener-shaped failure; see noteSilentTarget.
+				if total == 0 {
+					t.noteSilentTarget()
 				}
 				return
 			}
@@ -412,6 +440,51 @@ func sendChunked(
 		offset = end
 	}
 	return true
+}
+
+// The TLS hints are per process, not per connection.
+//
+// There is one data channel per HTTP request, so a hint emitted per tunnel would
+// print once per request — twenty identical lines for one page load. A
+// diagnostic that floods is a diagnostic nobody reads.
+var (
+	tlsRecordHint sync.Once
+	tlsSilentHint sync.Once
+)
+
+// noteTargetProtocol turns a confusing failure into an actionable one.
+//
+// Speaking plaintext HTTP to a TLS listener is the mistake most likely to be
+// made here, and it produces no useful error anywhere: the target answers with a
+// TLS alert record and the browser sees "no header terminator", which says
+// nothing about the actual mistake. One look at the first bytes settles it.
+//
+// This covers servers that send an alert. Servers that simply hang up are
+// covered by noteSilentTarget — between them both shapes are reported.
+func (t *Tunnel) noteTargetProtocol(first []byte) {
+	if t.sawTLS {
+		return
+	}
+	t.sawTLS = true
+	hint := tlsHint(t.tlsMode)
+	if hint == "" || !looksLikeTLS(first) {
+		return
+	}
+	tlsRecordHint.Do(func() {
+		log.Printf("target %s replied with a TLS record: %s", t.target, hint)
+	})
+}
+
+// noteSilentTarget covers the other half: a TLS listener that answers a
+// plaintext request by closing the connection without sending a byte.
+func (t *Tunnel) noteSilentTarget() {
+	hint := tlsHint(t.tlsMode)
+	if hint == "" {
+		return
+	}
+	tlsSilentHint.Do(func() {
+		log.Printf("target %s closed without sending anything: %s", t.target, hint)
+	})
 }
 
 func (t *Tunnel) close() {

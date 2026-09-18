@@ -118,7 +118,7 @@ The full reasoning is in **[docs/GOTCHAS.en.md § 6](docs/GOTCHAS.en.md)**.
 | **Chunked / compressed responses** | Not stated | ✅ Dechunked, decompressed, and gzip is negotiated proactively ([§2.15](docs/GOTCHAS.en.md)) |
 | **Protocols once a CLI is installed** | **Any TCP + UDP** (`internal/proxy/tcp.go`, `udp.go`) | Not offered — pinhole has no CLI-client side |
 | Docker / TUI | ✅ Docker sidecar isolation, live TUI | ❌ |
-| Documentation | README + a configuration guide | **36 documented traps** ("symptom → cause → fix → how we found out") + measured numbers |
+| Documentation | README + a configuration guide | **39 documented traps** ("symptom → cause → fix → how we found out") + measured numbers |
 | Activity | 3 commits over 0.8 h, untouched since, 1 star | Runs on real hardware, with measured numbers |
 
 **What we learned from BTunnel** (the first four are places it is ahead of pinhole; the fifth is now done):
@@ -277,7 +277,25 @@ go run ./packages/agent \
 | `-secret` | **Required in MQTT mode**; must equal the browser's access key |
 | `-token` | Optional auth token (WS mode) |
 | `-target` | Local TCP target — your service |
+| `-target-tls` | Encrypt the hop to the target: `off` (default) / `insecure` / `verify`. See below |
+| `-target-tls-ca` | PEM file of extra roots to trust (with `verify`; for a self-signed certificate) |
+| `-target-tls-sni` | Override the SNI and the name verified against (default: the target's host) |
 | `-stun` | STUN server; pass an empty string to disable (LAN / tests) |
+
+**What `-target-tls` is for**: the browser-to-agent leg is already encrypted by DTLS 1.3, which
+WebRTC requires, but **the agent-to-target leg is plaintext by default**. So this switch is about
+**interoperability** — getting a TLS-only target to talk to you — not about adding secrecy to a path
+DTLS already covers.
+
+| Value | Meaning | When |
+|---|---|---|
+| `off` (default) | Plaintext. Least ceremony | The target speaks plain HTTP, typically behind a local reverse proxy |
+| `insecure` | TLS, certificate **not** verified. The wire is encrypted | The target has a self-signed certificate (the common case). **This is the default that fits the purpose** — who the peer is is the application's business |
+| `verify` | TLS with verification (system roots plus `-target-tls-ca`) | When you also want "am I talking to the wrong service?" to be noticed |
+
+> If the target is TLS-only and you forget the switch, **it does not fail mysteriously**: the page
+> says `the target accepted the connection but sent nothing — if it only speaks TLS, restart the
+> agent with -target-tls insecure`, and the agent's console says so once too.
 
 **Precedence: built-in defaults → `agent.json` → command-line flags.** Only flags *actually passed* override the
 file, so once your settings live in `agent.json` the daily command is just `./agent` — **and the secret never

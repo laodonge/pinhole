@@ -112,7 +112,7 @@
 | **分块 / 压缩响应** | 未说明 | ✅ 自己去分块、自己解压，并主动协商 gzip（[§2.15](docs/GOTCHAS.md#215-sw-合成的响应不会被浏览器解码分块压缩都要自己做)） |
 | **装了 CLI 之后能承载的协议** | **任意 TCP + UDP**（`internal/proxy/tcp.go`、`udp.go`） | 不做——pinhole 没有 CLI 客户端那一端 |
 | Docker / TUI | ✅ Docker sidecar 隔离、实时 TUI | ❌ |
-| 文档 | README + 配置指南 | **36 条踩坑记录**（每条「症状 → 原因 → 修法 → 怎么发现」）+ 实测数据 |
+| 文档 | README + 配置指南 | **39 条踩坑记录**（每条「症状 → 原因 → 修法 → 怎么发现」）+ 实测数据 |
 | 活跃度 | 3 次提交跨度 0.8 小时，此后未更新，1 star | 真机跑通、有实测数字 |
 
 **从 BTunnel 学到的东西**（前四件 pinhole 做得不如它，第五件已经补上）：
@@ -270,7 +270,24 @@ go run ./packages/agent \
 | `-secret` | **MQTT 模式必填**，必须和浏览器的访问密钥一致 |
 | `-token` | 可选鉴权 token（WS 模式） |
 | `-target` | 本地 TCP 目标（你的业务服务） |
+| `-target-tls` | 回源是否用 TLS：`off`（默认）/ `insecure` / `verify`。见下 |
+| `-target-tls-ca` | 额外信任的根证书 PEM（配合 `verify`，用于自签证书） |
+| `-target-tls-sni` | 覆盖 SNI 与校验用的名字（默认取 target 的 host） |
 | `-stun` | STUN 服务器；传空字符串可禁用（局域网/测试用） |
+
+**`-target-tls` 是干什么的**：浏览器到 agent 那段本来就被 WebRTC 强制用 DTLS 1.3 加密，
+但** agent 到目标那一段默认是明文**。所以这个开关解决的是**互操作性**——让只肯说 TLS 的目标愿意跟你说话，
+而不是给整条链路加机密性（那是 DTLS 已经在做的事）。
+
+| 值 | 含义 | 什么时候用 |
+|---|---|---|
+| `off`（默认） | 明文。最省事 | 目标在本机反代后面、说纯 HTTP |
+| `insecure` | TLS，**不验证证书**。链路是加密的 | 目标自带自签证书（最常见）。**这也是符合目的的默认**——"对面是谁"是应用层的事 |
+| `verify` | TLS，验证证书（系统根 + `-target-tls-ca`） | 想要"连错服务能发现"这一层 |
+
+> 如果目标是 TLS-only，而你忘了开这个开关，**不会失败得莫名其妙**：页面会直接给出
+> `the target accepted the connection but sent nothing — if it only speaks TLS, restart the agent with -target-tls insecure`，
+> agent 的控制台也会各提示一次。
 
 **优先级：内置默认 → `agent.json` → 命令行参数。** 只有**显式传入**的参数才覆盖配置文件，
 所以一个固定配置写进 `agent.json` 之后就只需要 `./agent` 一条命令——而且密钥不会进 shell 历史。

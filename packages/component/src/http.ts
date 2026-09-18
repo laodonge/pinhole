@@ -99,7 +99,7 @@ export async function splitResponse(
     const { done, value } = await reader.read();
     if (done) {
       reader.releaseLock();
-      throw new Error("invalid HTTP response: no header terminator");
+      throw new Error(describeNonHttp(buffered));
     }
     buffered = concat([buffered, value]);
     const idx = findCrlfCrlf(buffered);
@@ -111,6 +111,44 @@ export async function splitResponse(
       return { meta, body };
     }
   }
+}
+
+/**
+ * Explain what came back when it was not HTTP.
+ *
+ * The generic "no header terminator" is technically true and practically
+ * useless. The overwhelmingly likely cause is a target that only speaks TLS, and
+ * it has two shapes: a server that answers a plaintext request with a TLS alert
+ * record, and one that simply hangs up. Both are recognisable from here, and
+ * both have the same one-line fix.
+ */
+function describeNonHttp(seen: Uint8Array): string {
+  if (seen.length === 0) {
+    return (
+      "the target accepted the connection but sent nothing — " +
+      "if it only speaks TLS, restart the agent with `-target-tls insecure`"
+    );
+  }
+  if (looksLikeTLS(seen)) {
+    return (
+      "the target replied with a TLS record, so it is not speaking plain HTTP — " +
+      "restart the agent with `-target-tls insecure` (or " +
+      "`-target-tls verify -target-tls-ca <pem>` to check the certificate too)"
+    );
+  }
+  const preview = decoder
+    .decode(seen.subarray(0, 60))
+    .replace(/[^\x20-\x7e]/g, ".");
+  return `invalid HTTP response: no header terminator (first bytes: ${JSON.stringify(preview)})`;
+}
+
+/** Whether a stream starts with a TLS record rather than an HTTP message. */
+function looksLikeTLS(b: Uint8Array): boolean {
+  if (b.length < 3) return false;
+  // 0x16 handshake, 0x15 alert, 0x14 change cipher spec; 0x03 is the major
+  // version of every TLS record since SSLv3.
+  if (b[0] !== 0x16 && b[0] !== 0x15 && b[0] !== 0x14) return false;
+  return b[1] === 0x03;
 }
 
 function parseHead(headBytes: Uint8Array): ResponseMeta {
