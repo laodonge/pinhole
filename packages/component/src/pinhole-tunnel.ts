@@ -31,6 +31,35 @@ interface WsSession {
   port: MessagePort;
 }
 
+/** A cookie this proxy is holding on the target's behalf. */
+interface JarEntry {
+  /** The value. */
+  v: string;
+  /** Absolute expiry in ms, when the target sent `Max-Age`. */
+  e?: number;
+}
+
+/**
+ * Optional persistence for the cookie jar, supplied by the page.
+ *
+ * The component deliberately does not choose *where* cookies live between page
+ * loads — that is deployment policy (a session token in `sessionStorage`, a
+ * shared jar for several tunnels, a server-side store) and it belongs to
+ * whoever embedded the component. It does keep a jar for the lifetime of the
+ * page, because without one cookies do not work at all: a `Set-Cookie` on a
+ * response the worker synthesised is never stored by the browser, so the target
+ * would see an anonymous request.
+ *
+ * Both methods speak the same format as the `Cookie` header, which is what makes
+ * this two functions instead of an API.
+ */
+export interface CookieStore {
+  /** The cookies this hostname should carry, or null. */
+  restore(hostname: string): string | null;
+  /** The complete cookie state for this hostname, after every change. */
+  persist(hostname: string, cookies: string): void;
+}
+
 /**
  * How often the page re-asserts its registration with the worker.
  *
@@ -77,6 +106,15 @@ export class PinholeTunnelElement extends HTMLElement {
    * settled besides `room`, because a reverse proxy routes on it.
    */
   private upstreamHost: string | null = null;
+
+  /**
+   * Optional cookie persistence, supplied by the page. See `CookieStore`.
+   *
+   * A property rather than an attribute, because it is behaviour and not a
+   * string. Set it *before* appending the element: a session starts as soon as
+   * the element is connected.
+   */
+  cookieStore: CookieStore | null = null;
   /**
    * Paths the worker must never proxy — the shell's own files.
    *
@@ -126,7 +164,7 @@ export class PinholeTunnelElement extends HTMLElement {
    * path matching. Modelling a browser is a large job and the browser doing it
    * is right there — the one thing it will not do is hand the value over.
    */
-  private jar = new Map<string, Map<string, string>>();
+  private jar = new Map<string, Map<string, JarEntry>>();
   /** Live virtual websockets, keyed by the id the shim assigned. */
   private wsSessions = new Map<string, WsSession>();
 
@@ -456,6 +494,9 @@ export class PinholeTunnelElement extends HTMLElement {
    * one (`Wed, 21 Oct 2015 07:28:00 GMT`).
    */
   private absorbCookies(hostname: string, headers: Array<[string, string]>): void {
+    let jar = this.jar.get(hostname);
+    let changed = false;
+
     for (const [k, v] of headers) {
       if (k.toLowerCase() !== "set-cookie") continue;
 
@@ -467,7 +508,6 @@ export class PinholeTunnelElement extends HTMLElement {
       if (!name) continue;
       const value = pair.slice(eq + 1).trim();
 
-      let jar = this.jar.get(hostname);
       if (!jar) {
         jar = new Map();
         this.jar.set(hostname, jar);
@@ -477,12 +517,25 @@ export class PinholeTunnelElement extends HTMLElement {
       // An empty value, or Max-Age=0, is how a server deletes a cookie. Storing
       // the empty string instead would send `name=` forever, which some servers
       // treat as a present-but-invalid session rather than as no session.
-      if (value === "" || /(?:^|;)\s*max-age\s*=\s*0\s*(?:;|$)/.test(attrs)) {
-        jar.delete(name);
-      } else {
-        jar.set(name, value);
+      const maxAge = /(?:^|;)\s*max-age\s*=\s*(-?\d+)\s*(?:;|$)/.exec(attrs);
+
+      if (value === "" || (maxAge && Number(maxAge[1]) <= 0)) {
+        if (jar.delete(name)) changed = true;
+        continue;
       }
+
+      // `Max-Age` is honoured because the jar now outlives the page: without it a
+      // cookie the server asked to expire would come back on the next load.
+      // `Expires` is not parsed — it is a date, and any server that means it
+      // sends `Max-Age` too.
+      const entry: JarEntry = maxAge
+        ? { v: value, e: Date.now() + Number(maxAge[1]) * 1000 }
+        : { v: value };
+      jar.set(name, entry);
+      changed = true;
     }
+
+    if (changed) this.saveJar(hostname);
   }
 
   /**
@@ -502,13 +555,60 @@ export class PinholeTunnelElement extends HTMLElement {
         if (eq > 0) merged.set(part.slice(0, eq).trim(), part.slice(eq + 1).trim());
       }
     }
-    const jar = this.jar.get(hostname);
-    if (jar) {
-      for (const [name, value] of jar) merged.set(name, value);
+
+    const jar = this.loadJar(hostname);
+    const now = Date.now();
+    let dropped = false;
+    for (const [name, entry] of jar) {
+      if (entry.e !== undefined && entry.e <= now) {
+        jar.delete(name);
+        dropped = true;
+        continue;
+      }
+      merged.set(name, entry.v);
     }
+    if (dropped) this.saveJar(hostname);
 
     if (merged.size === 0) return null;
     return [...merged].map(([name, value]) => `${name}=${value}`).join("; ");
+  }
+
+  /**
+   * Read the jar for `hostname` out of the page's store, once.
+   *
+   * The store is the page's business; see `CookieStore`. Without one the jar
+   * simply does not survive the page load, and the page has said it does not
+   * want it to.
+   */
+  private loadJar(hostname: string): Map<string, JarEntry> {
+    const existing = this.jar.get(hostname);
+    if (existing) return existing;
+
+    const jar = new Map<string, JarEntry>();
+    try {
+      const raw = this.cookieStore?.restore(hostname) ?? null;
+      if (raw) {
+        for (const part of raw.split(";")) {
+          const eq = part.indexOf("=");
+          if (eq > 0) jar.set(part.slice(0, eq).trim(), { v: part.slice(eq + 1).trim() });
+        }
+      }
+    } catch {
+      // A store that throws just means nothing was restored.
+    }
+    this.jar.set(hostname, jar);
+    return jar;
+  }
+
+  private saveJar(hostname: string): void {
+    const jar = this.jar.get(hostname);
+    if (!jar || !this.cookieStore) return;
+    const cookies = [...jar].map(([name, entry]) => `${name}=${entry.v}`).join("; ");
+    try {
+      this.cookieStore.persist(hostname, cookies);
+    } catch {
+      // Storage full or blocked: the jar still works for this page load.
+    }
   }
 
   private async pump(id: string, stream: ReadableStream<Uint8Array>): Promise<void> {

@@ -675,6 +675,53 @@ will not say — **you have to log in again through pinhole**.
 
 ---
 
+### 2.12.1 An in-memory jar means every reload logs you out
+
+| | |
+|---|---|
+| **Symptom** | Logging in works, then **a reload puts you back at "not logged in"** — while a cookie the shell's own server sets is fine |
+| **Cause** | The browser **never stores** a `Set-Cookie` that arrives on a Service-Worker-synthesised response. So a cookie the target sets exists **only in the jar**, and the jar was a table in the component's memory — gone on reload |
+| **Fix** | Have the **page** persist the jar. The component exposes a `cookieStore` interface and chooses no storage itself |
+
+Measured, reloading in the same tab:
+
+```
+before reload  whoami saw: plainprobe=visible; tunnel_plain=visible; tunnel_secret=hidden
+after  reload  whoami saw: plainprobe=visible          ← both target-set cookies gone
+```
+
+Only `plainprobe` survived, because the **shell's own server** set it — a real network response, which
+the browser stores by itself.
+
+**Why persistence belongs to the page and not the component**: where cookies live is deployment policy
+— `sessionStorage`, a jar shared across tunnels, a server-side store — and one page may hold several
+tunnels. The component stays policy-free and only offers the interface:
+
+```ts
+tunnel.cookieStore = {
+  restore(hostname) { /* the cookie string for this hostname, or null */ },
+  persist(hostname, cookies) { /* the full state; store it wherever you like */ },
+};
+```
+
+Both methods speak nothing but the `Cookie` header format, which is why this is **two functions rather
+than an API**. The bootstrap implements it with `sessionStorage` — matching how a browser treats a
+session cookie, i.e. until the tab goes away.
+
+**What the jar honours, and what it does not** (it is deliberately incomplete; do not treat it as a
+browser):
+
+| Honoured | Not honoured |
+|---|---|
+| `name=value`, several `Set-Cookie` in one response | `Path`, `Domain`, `Secure`, `SameSite` |
+| `Max-Age` (including `Max-Age=0` as deletion) | `Expires` (a date — any server that means it sends `Max-Age` too) |
+| — | **`HttpOnly` is deliberately ignored** — that is the entire point |
+
+> **Lesson**: **bypassing the network stack means doing its job for it.** The browser will not store
+> the cookie, so we do — and *where* to keep it is the embedder's policy, not the transport's.
+
+---
+
 ### 2.13 A write before the data channel is open is silently dropped
 
 | | |

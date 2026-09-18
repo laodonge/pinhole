@@ -8,12 +8,13 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
+      "types": "./dist/index.d.ts",
       "import": "./dist/pinhole.js"
     }
   },
   "scripts": {
     "dev": "vite",
-    "build": "vite build && vite build --config vite.shim.config.ts",
+    "build": "vite build && vite build --config vite.shim.config.ts && tsc -p tsconfig.types.json",
     "typecheck": "tsc --noEmit",
     "test:mqtt": "esbuild test/mqtt-signaling.test.ts --bundle --platform=node --format=esm --target=node20 --outfile=dist-test/mqtt.mjs && node dist-test/mqtt.mjs",
     "test:ws": "esbuild test/websocket.test.ts --bundle --platform=node --format=esm --target=node20 --external:ws --outfile=dist-test/ws.mjs && node dist-test/ws.mjs"

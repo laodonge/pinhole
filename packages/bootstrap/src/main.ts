@@ -16,6 +16,7 @@
  */
 
 import "@pinhole/component";
+import type { PinholeTunnelElement } from "@pinhole/component";
 import { diagnoseNAT } from "./netdiag";
 
 interface EtConfig {
@@ -269,7 +270,7 @@ function start(): void {
   }
 
   // 元素必须在 attributes 设置好之后再挂载：connectedCallback 一被调用就会开始连接。
-  const tunnel = document.createElement("pinhole-tunnel");
+  const tunnel = document.createElement("pinhole-tunnel") as PinholeTunnelElement;
   tunnel.setAttribute("signal", signal);
   tunnel.setAttribute("signal-kind", signalKind);
   tunnel.setAttribute("room", room);
@@ -278,6 +279,32 @@ function start(): void {
   // 身份由这个页面决定并交给组件；不填就是"用请求自己的 Host"。
   if (config.domain) tunnel.setAttribute("domain", config.domain);
   if (config.wakeLock) tunnel.setAttribute("wake-lock", "");
+
+  // cookie 存哪儿是**页面的策略**，组件只提供接口。
+  //
+  // 为什么这个页面必须实现它：浏览器**从不存储** Service Worker 合成响应上的
+  // `Set-Cookie`，所以目标下发的 cookie 只活在组件内存里——不持久化的话，
+  // 每次刷新都等于登出（实测：刷新后目标收到的请求里一个 cookie 都没有）。
+  //
+  // 用 sessionStorage：和浏览器对"会话 cookie"的处理一致（关掉标签页就没），
+  // 而且不会把令牌留在比会话活得更久的存储里。
+  tunnel.cookieStore = {
+    restore: (host) => {
+      try {
+        return sessionStorage.getItem(`pinhole-jar:${host}`);
+      } catch {
+        return null;
+      }
+    },
+    persist: (host, cookies) => {
+      try {
+        if (cookies) sessionStorage.setItem(`pinhole-jar:${host}`, cookies);
+        else sessionStorage.removeItem(`pinhole-jar:${host}`);
+      } catch {
+        // 存储被禁用或写满：本次页面加载内仍然可用。
+      }
+    },
+  };
 
   tunnel.addEventListener("signaling-ready", () => {
     // 信令通了，但还没看到 agent —— 这一步最容易被误判成"打洞失败"。

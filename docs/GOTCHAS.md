@@ -673,6 +673,49 @@ c.SetCookie(constant.SessionName, sessionID, ttlSeconds, "/", "", secure, true)
 
 ---
 
+### 2.12.1 jar 只活在内存里 = 每次刷新都登出
+
+| | |
+|---|---|
+| **症状** | 登录能用，**一刷新就打回未登录**；但同一个 cookie 在外壳服务器自己发的响应里就没事 |
+| **原因** | 浏览器**从不存储** Service Worker 合成响应上的 `Set-Cookie`。所以目标下发的 cookie **只存在于 jar 里**，而 jar 是组件内存里的一张表——刷新即清零 |
+| **修法** | 由**页面**把 jar 持久化。组件开放 `cookieStore` 接口，自己不选存储 |
+
+实测（同一标签页刷新）：
+
+```
+刷新前  whoami 收到: plainprobe=visible; tunnel_plain=visible; tunnel_secret=hidden
+刷新后  whoami 收到: plainprobe=visible          ← 目标设的两条都没了
+```
+
+只有 `plainprobe` 活着，因为它是**外壳服务器**发的（真实网络响应，浏览器自己存的）。
+
+**为什么持久化交给页面而不是组件**：存哪儿是部署策略——`sessionStorage`、跨隧道的共享 jar、服务端存储——
+而且一个页面可能同时有多个隧道。组件保持策略中立，只提供接口：
+
+```ts
+tunnel.cookieStore = {
+  restore(hostname) { /* 返回该 hostname 的 cookie 串，或 null */ },
+  persist(hostname, cookies) { /* 收到完整状态，自己决定存哪 */ },
+};
+```
+
+两个方法都只说 `Cookie` 头的格式，所以是**两个函数，不是一套 API**。引导页用 `sessionStorage` 实现
+（和浏览器对"会话 cookie"的处理一致：关掉标签页就没）。
+
+**jar 遵守什么、不遵守什么**（它是刻意不完整的，别当浏览器用）：
+
+| 遵守 | 不遵守 |
+|---|---|
+| `name=value`、一个响应里多条 `Set-Cookie` | `Path`、`Domain`、`Secure`、`SameSite` |
+| `Max-Age`（含 `Max-Age=0` 的删除语义） | `Expires`（是日期；真在意的服务器会同时发 `Max-Age`） |
+| —— | **`HttpOnly` 是故意不理的**——那正是整件事的意义 |
+
+> 教训：**绕过了网络栈，就得替它把该做的事做回来。** 浏览器不存，我们存；而"存在哪里"
+> 是使用者的策略，不是传输组件的。
+
+---
+
 ### 2.13 DataChannel 还没 open 时的写入会被静默丢弃
 
 | | |

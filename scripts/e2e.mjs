@@ -574,6 +574,27 @@ async function wsCheck() {
 }
 
 (async function () {
+  // Second load in the same tab: check whether cookies the *target* set are
+  // still being sent. The jar lives in the component's memory, so this is the
+  // question "does a page reload log you out".
+  if (sessionStorage.getItem("pinhole-e2e-phase") === "reload") {
+    log("--- reload: do target-set cookies survive? ---");
+    try {
+      const r = await fetchT("/api/http/whoami");
+      const j = await r.json();
+      const seen = String(j.cookie);
+      log("cookie after reload: " + (seen || "(none)"));
+      eq("reload keeps the plain cookie", seen.indexOf("tunnel_plain=visible") !== -1, true);
+      eq("reload keeps the HttpOnly cookie", seen.indexOf("tunnel_secret=hidden") !== -1, true);
+    } catch (e) {
+      log("FAIL reload check threw: " + e);
+    }
+    log("--- done ---");
+    report();
+    return;
+  }
+  sessionStorage.setItem("pinhole-e2e-phase", "reload");
+
   // Warm-up: the first proxied request after a cold start pays for the tunnel
   // being established, and timing that out says nothing about correctness.
   try { await fetchT("/api/http/text", null, 45000); } catch (e) { log("warm-up: " + e); }

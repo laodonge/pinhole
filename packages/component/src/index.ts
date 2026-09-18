@@ -1,6 +1,6 @@
 import { PinholeTunnelElement } from "./pinhole-tunnel";
 
-export { PinholeTunnelElement };
+export { PinholeTunnelElement, type CookieStore } from "./pinhole-tunnel";
 export { Tunnel, type TunnelStatus } from "./tunnel";
 export {
   SignalingClient,
