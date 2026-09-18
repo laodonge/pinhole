@@ -250,6 +250,14 @@ async function httpApi(req, res, url) {
       res.end(JSON.stringify({ bytes: BIG_BYTES, sha: LARGE_SHA }));
       return;
     }
+
+    // A service worker script for the "the app registers its own" check. Its
+    // content is irrelevant — what matters is the scope it claims.
+    case "/app-sw.js": {
+      res.writeHead(200, { "content-type": "text/javascript" });
+      res.end("self.addEventListener('install', () => self.skipWaiting());\n");
+      return;
+    }
   }
 
   // The 1Panel terminal mock: dual-purpose HTTP + WS endpoint.
@@ -528,6 +536,39 @@ async function httpChecks() {
     eq("target cookie (plain) round trip", seen.indexOf("tunnel_plain=visible") !== -1, true);
     eq("target cookie (HttpOnly) round trip", seen.indexOf("tunnel_secret=hidden") !== -1, true);
   } catch (e) { log("FAIL set-cookies threw: " + e); }
+
+  // 13. the app registering its own service worker at scope "/". Common in SPAs,
+  // and the scope is the one the tunnel needs — so this asks whether the tunnel
+  // survives being displaced.
+  try {
+    const reg = await navigator.serviceWorker.register("/app-sw.js", { scope: "/" });
+    log("app registered its own SW: " + (reg.active?.scriptURL ?? reg.installing?.scriptURL ?? "pending"));
+  } catch (e) {
+    log("app SW registration threw: " + e);
+  }
+  await new Promise(function (r) { setTimeout(r, 800); });
+  try {
+    const r = await fetchT("/api/http/text");
+    const t = await r.text();
+    eq("tunnel survives an app-registered SW", t === TEXT, true);
+  } catch (e) {
+    log("FAIL after app SW: " + e);
+  }
+
+  // 14. Could the whole thing ship as one file? That depends on whether a Service
+  // Worker can be registered from a blob URL — the SW script is the one piece that
+  // cannot be inlined into the page. Narrow scope on purpose: if this somehow
+  // succeeds it must not disturb the tunnel's own registration.
+  try {
+    const blob = new Blob(["self.addEventListener('install', () => self.skipWaiting());\\n"], {
+      type: "text/javascript",
+    });
+    const url = URL.createObjectURL(blob);
+    const reg = await navigator.serviceWorker.register(url, { scope: "/__blob-sw/" });
+    log("blob SW registered: " + (reg.active?.scriptURL ?? "pending"));
+  } catch (e) {
+    log("blob SW rejected: " + e.name + " — " + e.message);
+  }
 }
 
 async function wsCheck() {
@@ -610,6 +651,25 @@ async function wsCheck() {
 </script>
 </body>
 </html>`;
+
+// A syntax error inside the injected page script fails *silently in the browser*:
+// the document renders and not one line is logged, which looks like the tunnel
+// being down. `node --check` cannot see it — the script lives inside a template
+// literal — so it is parsed here instead, and the harness refuses to start.
+{
+  const script = PAGE_HTML.match(/<script>([\s\S]*?)<\/script>/);
+  if (!script) {
+    console.error("PAGE_HTML has no <script> block");
+    process.exit(1);
+  }
+  try {
+    // Parsed, never run: `new Function` compiles the body without executing it.
+    new Function(script[1]);
+  } catch (e) {
+    console.error(`the injected page script does not parse: ${e.message}`);
+    process.exit(1);
+  }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The shell host
