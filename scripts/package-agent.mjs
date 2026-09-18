@@ -41,11 +41,26 @@ function argValue(name) {
   return i !== -1 && process.argv[i + 1] ? process.argv[i + 1] : null;
 }
 
+/**
+ * The version to name the archives with.
+ *
+ * The git tag wins over `package.json`: releases here are cut as tags, and
+ * `package.json` has never tracked them, so trusting it silently names a fresh
+ * build after a release from months ago.
+ */
 function version() {
   const explicit = argValue("version");
   if (explicit) return explicit;
-  const pkg = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8"));
-  return pkg.version;
+
+  const tag = spawnSync("git", ["describe", "--tags", "--abbrev=0"], {
+    cwd: root,
+    encoding: "utf8",
+  });
+  if (tag.status === 0 && tag.stdout.trim()) {
+    return tag.stdout.trim().replace(/^v/, "");
+  }
+
+  return JSON.parse(readFileSync(path.join(root, "package.json"), "utf8")).version;
 }
 
 /** `go build` for one target, into `out`. */
