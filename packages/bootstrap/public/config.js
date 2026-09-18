@@ -33,18 +33,34 @@ window.__ET_CONFIG = {
   stun: "stun:stun.cloudflare.com:3478",
 
   /**
-   * 房间名。默认取域名最左边一段：
+   * 房间名 —— **必填**，没有默认值。
    *
-   *   nas.example.com   -> "nas"
-   *   files.example.com -> "files"
+   * 它是信令的会合键：浏览器和 agent 靠它找到彼此（主题 = SHA-256(room:secret)）。
+   * 所以它描述的是「**跟哪台 agent 配对**」，不是「访问哪个站点」——
+   * 站点是目标的 nginx 按 Host 头决定的。
    *
-   * 所以服务端 agent 用 `-room nas` 就能对上。想固定房间名就取消下面注释。
+   * 推荐：所有子域名共用一个（比如 "home"），于是加一个站点只需要改 nginx，
+   * agent 和这个文件都不用动。
+   *
+   * 这里**故意留空**：写一个看起来能用的默认值，只会让人部署完才发现自己
+   * 用的不是自己选的房间名。没填的话页面会直接告诉你。
    */
-  // room: "nas",
+  // room: "home",
 
   /**
-   * 你的根域名。填了它才能正确地从子域名推导房间名
-   * （否则 `nas.example.com` 和 `nas.example.com.cn` 都会取到 "nas"，虽然通常也能用）。
+   * 改成 true 则改为「每个子域名各自一个 room」（一个子域名 = 一个服务）。
+   *
+   * 只在**没有**用 nginx 按 Host 路由、而是想让每个子域名直接对接不同 target
+   * 时才用它，并且 agent.json 的 services 里要有对应的 room。
+   *
+   * 设了它就不能同时设 room —— 两个都写会直接报错，而不是悄悄挑一个。
+   */
+  // roomFromHostname: true,
+
+  /**
+   * 仅在上面为 true 时有用：你的根域名。
+   * 填了它才能正确地从子域名推导房间名（否则 `nas.example.com` 和
+   * `nas.example.com.cn` 都会取到 "nas"，虽然通常也能用）。
    */
   // rootDomain: "example.com",
 

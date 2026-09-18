@@ -22,7 +22,10 @@ interface EtConfig {
   signal?: string;
   signalKind?: "mqtt" | "ws";
   stun?: string;
+  /** The room, stated outright. Required unless `roomFromHostname`. */
   room?: string;
+  /** Derive the room from the hostname instead of stating it. */
+  roomFromHostname?: boolean;
   rootDomain?: string;
   keyParam?: string;
   keyStorageKey?: string;
@@ -116,15 +119,30 @@ function fingerprint(secret: string): string {
   return `${secret.slice(0, 4)}…${secret.slice(-4)} (${secret.length} 字符)`;
 }
 
-/** `nas.example.com` -> `nas`（或配置里的固定房间名）。 */
-function resolveRoom(): string {
-  if (config.room) return config.room;
-  const host = location.hostname;
-  const root = config.rootDomain;
-  if (root && host.endsWith(`.${root}`)) {
-    return host.slice(0, -(root.length + 1));
+/**
+ * The room, which the page has to state outright.
+ *
+ * Deliberately **no fallback to the hostname**. What a room *means* is a
+ * deployment decision — "which agent am I pairing with" — and the component is
+ * policy-free: it takes a room and does nothing else with it. A silent guess here
+ * would work in testing and quietly misroute in production, and the failure
+ * (each hostname in its own room, so nothing ever pairs) looks exactly like the
+ * network being broken.
+ *
+ * `roomFromHostname` keeps the other shape available, but as an explicit choice:
+ * it is the right one when each subdomain maps to its own target instead of
+ * everything going to one nginx that routes by `Host`.
+ */
+function resolveRoom(): string | null {
+  if (config.roomFromHostname) {
+    const host = location.hostname;
+    const root = config.rootDomain;
+    if (root && host.endsWith(`.${root}`)) {
+      return host.slice(0, -(root.length + 1));
+    }
+    return host.split(".")[0] ?? host;
   }
-  return host.split(".")[0] ?? host;
+  return config.room ?? null;
 }
 
 /**
@@ -157,7 +175,7 @@ function start(): void {
 
   const rows: Array<{ k: string; v: string; level?: Level }> = [
     { k: "域名", v: host },
-    { k: "房间", v: room },
+    { k: "房间", v: room ?? "(未配置)", level: room ? undefined : "bad" },
     { k: "信令", v: `${signalKind} · ${signal}` },
     { k: "密钥", v: fingerprint(key ?? ""), level: key ? "ok" : "bad" },
     { k: "状态", v: "连接信令中…", level: "warn" },
@@ -179,6 +197,34 @@ function start(): void {
     report("未处理的错误", String((e as PromiseRejectionEvent).reason)),
   );
 
+  // Two ways to decide the room; picking one implicitly would be a coin flip
+  // that only shows up as "it never connects".
+  if (config.room !== undefined && config.roomFromHostname) {
+    setStatus(
+      "room 和 roomFromHostname 只能填一个",
+      `<code>room</code> 写的是固定房间名，<code>roomFromHostname</code> 说的是从域名推导，` +
+        `两个都要就没法判断你要哪个。<br />` +
+        `用 nginx 按 Host 路由 → 只填 <code>room</code>；` +
+        `一个子域名对一个服务 → 只填 <code>roomFromHostname: true</code>。`,
+      true,
+    );
+    setState("room 配置冲突", "bad");
+    return;
+  }
+
+  if (!room) {
+    setStatus(
+      "config.js 里没有设置 room",
+      `房间名是必填的——它是浏览器和 agent 的会合键，没有它两边找不到彼此。<br />` +
+        `在 <code>config.js</code> 里填上 <code>room: "…"</code>` +
+        `（要和 agent.json 里那个 service 的 <code>room</code> 一致）。<br />` +
+        `如果确实想让每个子域名各自一个房间，改成 <code>roomFromHostname: true</code>。`,
+      true,
+    );
+    setState("缺少 room 配置", "bad");
+    return;
+  }
+
   if (!key) {
     setStatus(
       "需要访问密钥",
@@ -190,11 +236,13 @@ function start(): void {
     return;
   }
 
-  if (host.split(".").length < 3 && !config.room) {
+  // Only meaningful in the hostname-derived mode, and only a warning there: a
+  // short hostname still yields a room, it may just not be the one you meant.
+  if (config.roomFromHostname && host.split(".").length < 3) {
     setStatus(
       "看起来不像子域名",
       `当前主机是 <code>${host}</code>，从它推导出的房间名是 <code>${room}</code>。<br />` +
-        `服务端 agent 的 <code>-room</code> 必须等于这个值。`,
+        `服务端 agent 里必须有 <code>room: "${room}"</code> 这一项。`,
       true,
     );
     setState("房间名存疑", "warn");

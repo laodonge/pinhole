@@ -353,6 +353,43 @@ Log lines carry the room, so one process is still readable:
 The old single-service shape (top-level `room` + `target`) **still works** and is treated as a one-entry
 list — both shapes go through the same code path, so they cannot drift apart.
 
+### Division of labour: pinhole transports, the reverse proxy chooses the site
+
+**It does not know what it is carrying, and it should not know which site you are reaching either.**
+That line decides every trade-off below:
+
+| Who | Responsible for |
+|---|---|
+| Static hosting + DNS + certificates | Making every domain you use **able to serve the shell** (each registers its own Service Worker) |
+| **nginx / any reverse proxy** | **Which domain → which backend** |
+| The bootstrap page / your page | How `room` is determined (from config, from the hostname, chosen by the user) |
+| **pinhole** | Taking a settled `room` and delivering bytes to the agent |
+
+So `room` names "**which machine to pair with**", not "which site":
+
+```
+room  ->  which agent     one per machine
+Host  ->  which site      nginx routes on it
+```
+
+Three sites on one machine → **one `room`**, and adding a site touches only nginx (no agent restart,
+no `config.js` change).
+
+| The app's shape | What it requires | Certificates |
+|---|---|---|
+| A single domain of its own | Put the shell on that domain | 1 |
+| A fixed handful of subdomains | Each subdomain must be able to serve the shell | N (free single-domain certs are fine) |
+| **Arbitrary subdomains** (the app generates them) | The same, and it is the **only** option | **A wildcard certificate — unavoidable** |
+
+That third row is a hard requirement: **a Service Worker can only intercept origins it was registered
+on**. The wildcard certificate does not buy nginx routing (that is free) — it buys "every subdomain can
+register a worker".
+
+**Absolute URLs hardcoded in the app escape the tunnel** (different origin — the worker never sees
+them), showing up as `ERR_NAME_NOT_RESOLVED`, a 404, or worst of all **200 + HTML parsed as JSON**.
+How to check and what to do is in the deployment guide, `docs/DEPLOY-AGENT.md` §5 (Chinese only; it is
+also the `README.md` shipped inside the release archive).
+
 **Signaling failures reconnect automatically** (exponential backoff capped at 30 s; reset once a session has
 been healthy for a minute), so a dropped broker connection does not leave your service dark.
 

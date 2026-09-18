@@ -80,6 +80,9 @@ function record(req, body) {
     // targets, "it worked" is not enough — this is what proves the room routed
     // to the target it was supposed to.
     port: req.socket.localPort ?? null,
+    // The Host header decides whether one target (say nginx) could route
+    // subdomains itself, which is an alternative to one room per service.
+    host: req.headers.host ?? null,
     method: req.method,
     url: req.url,
     cookie: req.headers.cookie ?? null,
@@ -638,7 +641,7 @@ const shell = http.createServer(async (req, res) => {
   const rel = url.pathname === "/" ? "/index.html" : url.pathname;
   const file = path.join(dist, path.normalize(rel).replace(/^([/\\])+/, ""));
   try {
-    const body = await readFile(file);
+    let body = await readFile(file);
     const headers = { "content-type": MIME[path.extname(file)] ?? "application/octet-stream" };
     // The HttpOnly cookie lives on the *shell* origin and is never readable from
     // JavaScript. `plainprobe` is the control: same origin, same path, but not
@@ -649,6 +652,30 @@ const shell = http.createServer(async (req, res) => {
         `${SESSION_COOKIE}; HttpOnly; Path=/`,
         "plainprobe=visible; Path=/",
       ];
+    }
+    // The room is required now, so the harness has to state it. Without
+    // PIN_ROOM it opts into the hostname-derived shape, which is what the
+    // multi-service checks need (one hostname per room); with it, several
+    // hostnames pair with one agent — the "nginx routes by Host" shape.
+    // NO_ROOM deliberately leaves it unset, to exercise the error path.
+    if (rel === "/config.js" && !process.env.NO_ROOM) {
+      if (process.env.PIN_ROOM) {
+        body = Buffer.concat([
+          body,
+          Buffer.from(
+            `\nwindow.__ET_CONFIG.room = ${JSON.stringify(process.env.PIN_ROOM)};` +
+              `\ndelete window.__ET_CONFIG.roomFromHostname;\n`,
+          ),
+        ]);
+      } else {
+        body = Buffer.concat([
+          body,
+          Buffer.from(
+            `\nwindow.__ET_CONFIG.roomFromHostname = true;` +
+              `\ndelete window.__ET_CONFIG.room;\n`,
+          ),
+        ]);
+      }
     }
     res.writeHead(200, headers);
     res.end(body);
