@@ -216,8 +216,8 @@ func (c *mqttClient) write(packet []byte) error {
 func (c *mqttClient) sendConnect(clientID string, keepaliveSeconds uint16) error {
 	body := make([]byte, 0, 32+len(clientID))
 	body = append(body, encodeMQTTString("MQTT")...)
-	body = append(body, 0x04)             // protocol level 4 = MQTT 3.1.1
-	body = append(body, 0x02)             // connect flags: clean session
+	body = append(body, 0x04) // protocol level 4 = MQTT 3.1.1
+	body = append(body, 0x02) // connect flags: clean session
 	body = append(body, byte(keepaliveSeconds>>8), byte(keepaliveSeconds))
 	body = append(body, encodeMQTTString(clientID)...)
 	return c.write(buildPacket(pktConnect, 0x00, body))

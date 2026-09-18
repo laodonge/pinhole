@@ -13,9 +13,13 @@ import (
 )
 
 type Agent struct {
+	// room labels this agent's log lines. With several services in one process,
+	// an unlabelled "agent connected" says nothing about which one it was.
+	room   string
 	target string
 	// dial reaches the target. A function rather than a fixed net.Dial so that
-	// -target-tls selects a TLS dial without every downstream caller knowing.
+	// the configured TLS mode selects a TLS dial without every downstream caller
+	// knowing.
 	dial    func() (net.Conn, error)
 	tlsMode string
 	stun    string
@@ -33,7 +37,8 @@ type Peer struct {
 type Tunnel struct {
 	// dial opens one connection to the target for this data channel.
 	dial func() (net.Conn, error)
-	// target is kept only for log messages.
+	// room and target are kept only for log messages.
+	room    string
 	target  string
 	tlsMode string
 	once    sync.Once
@@ -75,16 +80,23 @@ const (
 	bufferedAmountLowThreshold = 256 * 1024
 )
 
-// NewAgent builds the agent. `dial` reaches the target; see newTargetDialer for
-// how -target-tls turns that into a TLS connection.
-func NewAgent(target string, dial func() (net.Conn, error), tlsMode, stun string) *Agent {
+// NewAgent builds the agent for one service. `dial` reaches that service's
+// target; see newTargetDialer for how the TLS mode turns it into a TLS dial.
+func NewAgent(svc serviceConfig, dial func() (net.Conn, error), stun string) *Agent {
 	return &Agent{
-		target:  target,
+		room:    svc.Room,
+		target:  svc.Target,
 		dial:    dial,
-		tlsMode: tlsMode,
+		tlsMode: svc.TargetTLS,
 		stun:    stun,
 		peers:   make(map[string]*Peer),
 	}
+}
+
+// logf prefixes every line with the room, so one process serving several
+// services still produces a log you can follow.
+func (a *Agent) logf(format string, args ...any) {
+	log.Printf("["+a.room+"] "+format, args...)
 }
 
 // presenceInterval is how often the agent re-announces itself.
@@ -102,9 +114,9 @@ func (a *Agent) Run(sig SignalingChannel) error {
 	a.signal = sig
 	defer sig.Close()
 
-	log.Printf("agent connected to signaling, id=%s", sig.ID())
+	a.logf("connected to signaling, id=%s", sig.ID())
 	if servers := iceServerURLs(a.stun); len(servers) > 0 {
-		log.Printf("announcing ICE servers: %s", strings.Join(servers, ", "))
+		a.logf("announcing ICE servers: %s", strings.Join(servers, ", "))
 	}
 
 	go a.announceLoop(sig)
@@ -203,7 +215,7 @@ func (a *Agent) handleOffer(msg SignalMessage) {
 		newPeer, err := a.createPeer(msg.From)
 		if err != nil {
 			a.mu.Unlock()
-			log.Printf("create peer: %v", err)
+			a.logf("create peer: %v", err)
 			return
 		}
 		peer = newPeer
@@ -213,18 +225,18 @@ func (a *Agent) handleOffer(msg SignalMessage) {
 
 	var offer webrtc.SessionDescription
 	if err := json.Unmarshal([]byte(msg.SDP), &offer); err != nil {
-		log.Printf("parse offer: %v", err)
+		a.logf("parse offer: %v", err)
 		return
 	}
 	if err := peer.pc.SetRemoteDescription(offer); err != nil {
-		log.Printf("set remote description: %v", err)
+		a.logf("set remote description: %v", err)
 		return
 	}
 	if !peer.remoteSet {
 		peer.remoteSet = true
 		for _, c := range peer.pending {
 			if err := peer.pc.AddICECandidate(c); err != nil {
-				log.Printf("add pending candidate: %v", err)
+				a.logf("add pending candidate: %v", err)
 			}
 		}
 		peer.pending = nil
@@ -232,17 +244,17 @@ func (a *Agent) handleOffer(msg SignalMessage) {
 
 	answer, err := peer.pc.CreateAnswer(nil)
 	if err != nil {
-		log.Printf("create answer: %v", err)
+		a.logf("create answer: %v", err)
 		return
 	}
 	if err := peer.pc.SetLocalDescription(answer); err != nil {
-		log.Printf("set local description: %v", err)
+		a.logf("set local description: %v", err)
 		return
 	}
 
 	sdp, _ := json.Marshal(peer.pc.LocalDescription())
 	if err := a.signal.Send(SignalMessage{Type: "answer", SDP: string(sdp), To: msg.From}); err != nil {
-		log.Printf("send answer: %v", err)
+		a.logf("send answer: %v", err)
 	}
 }
 
@@ -270,7 +282,7 @@ func (a *Agent) createPeer(clientID string) (*Peer, error) {
 		}
 		candidate, _ := json.Marshal(c.ToJSON())
 		if err := a.signal.Send(SignalMessage{Type: "ice", Candidate: string(candidate), To: clientID}); err != nil {
-			log.Printf("send candidate: %v", err)
+			a.logf("send candidate: %v", err)
 		}
 	})
 
@@ -291,12 +303,12 @@ func (a *Agent) handleICE(msg SignalMessage) {
 
 	var c webrtc.ICECandidateInit
 	if err := json.Unmarshal([]byte(msg.Candidate), &c); err != nil {
-		log.Printf("parse candidate: %v", err)
+		a.logf("parse candidate: %v", err)
 		return
 	}
 	if peer.remoteSet {
 		if err := peer.pc.AddICECandidate(c); err != nil {
-			log.Printf("add candidate: %v", err)
+			a.logf("add candidate: %v", err)
 		}
 	} else {
 		peer.pending = append(peer.pending, c)
@@ -315,12 +327,18 @@ func (a *Agent) removePeer(id string) {
 func (a *Agent) handleDataChannel(dc *webrtc.DataChannel) {
 	tunnel := &Tunnel{
 		dial:    a.dial,
+		room:    a.room,
 		target:  a.target,
 		tlsMode: a.tlsMode,
 		done:    make(chan struct{}),
 	}
 	dc.OnOpen(func() { tunnel.start(dc) })
 	dc.OnClose(func() { tunnel.close() })
+}
+
+// logf mirrors Agent.logf for the per-connection code.
+func (t *Tunnel) logf(format string, args ...any) {
+	log.Printf("["+t.room+"] "+format, args...)
 }
 
 func (t *Tunnel) start(dc *webrtc.DataChannel) {
@@ -360,7 +378,7 @@ func (t *Tunnel) start(dc *webrtc.DataChannel) {
 
 		conn, err := t.dial()
 		if err != nil {
-			log.Printf("dial target %s: %v", t.target, err)
+			t.logf("dial target %s: %v", t.target, err)
 			return
 		}
 
@@ -373,7 +391,7 @@ func (t *Tunnel) start(dc *webrtc.DataChannel) {
 
 		for _, data := range queued {
 			if _, err := conn.Write(data); err != nil {
-				log.Printf("flush buffered request: %v", err)
+				t.logf("flush buffered request: %v", err)
 				return
 			}
 		}
@@ -395,7 +413,7 @@ func (t *Tunnel) start(dc *webrtc.DataChannel) {
 			}
 			if err != nil {
 				if err != io.EOF {
-					log.Printf("read target: %v", err)
+					t.logf("read target: %v", err)
 				}
 				// A target that accepted the connection and said nothing at all
 				// is the TLS-listener-shaped failure; see noteSilentTarget.
@@ -434,6 +452,8 @@ func sendChunked(
 			end = len(payload)
 		}
 		if err := dc.Send(payload[offset:end]); err != nil {
+			// Not a method on Tunnel, so no room label here; it is a
+			// data-channel failure and the caller logs the room around it.
 			log.Printf("send: %v", err)
 			return false
 		}
@@ -471,7 +491,7 @@ func (t *Tunnel) noteTargetProtocol(first []byte) {
 		return
 	}
 	tlsRecordHint.Do(func() {
-		log.Printf("target %s replied with a TLS record: %s", t.target, hint)
+		t.logf("target %s replied with a TLS record: %s", t.target, hint)
 	})
 }
 
@@ -483,7 +503,7 @@ func (t *Tunnel) noteSilentTarget() {
 		return
 	}
 	tlsSilentHint.Do(func() {
-		log.Printf("target %s closed without sending anything: %s", t.target, hint)
+		t.logf("target %s closed without sending anything: %s", t.target, hint)
 	})
 }
 

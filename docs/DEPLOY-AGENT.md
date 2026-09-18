@@ -5,10 +5,29 @@ agent 运行在**你要访问的那台机器**上，把它的本地 HTTP 服务�
 
 ---
 
+## 零、包里有什么
+
+```
+pinhole-agent         ← 程序本体（Windows 上是 pinhole-agent.exe）
+agent.json            ← 你要改的配置，自带注释
+README.md             ← 就是这份文档
+www/                  ← 传到你的静态托管（CloudBase / 你自己的域名），访问入口在这里
+```
+
+**两件事做完就能用**：把 `www/` 传上去，把 `agent.json` 改好，然后启动。
+
+```bash
+./pinhole-agent              # Windows: .\pinhole-agent.exe
+```
+
+Linux / macOS 上先 `chmod +x pinhole-agent`（跨平台打包时执行位可能丢失）。
+
+---
+
 ## 一、先诊断网络（建议先做，10 秒）
 
 ```bash
-./agent -mode stun-check
+./pinhole-agent -mode stun-check
 ```
 
 它一次回答三个问题：
@@ -35,20 +54,43 @@ agent 运行在**你要访问的那台机器**上，把它的本地 HTTP 服务�
 
 ## 二、填配置
 
-从模板复制一份：
+包里已经有一份 `agent.json`，**直接改它就行**——文件自带注释，写清楚每一项是什么。
+（注释是支持的：读取时会剥掉 `//` 和 `/* */`。）
 
-```bash
-cp agent.example.json agent.json
-```
+最少要改三处：
 
-```json
+```jsonc
 {
   "signal": "mqtts://broker.emqx.io:8883",
-  "room":   "nas",
-  "secret": "换成你自己的访问密钥",
-  "target": "127.0.0.1:5244",
-  "stun":   "stun:stun.miwifi.com:3478"
+
+  // ① 访问密钥，必须和浏览器 URL 里的 ?key= 完全一致
+  "secret": "换成一串很长的随机字符",
+
+  "services": [
+    // ② 房间名   ③ 要转发到的本机地址
+    { "room": "nas", "target": "127.0.0.1:5244" }
+  ]
 }
+```
+
+要转发多个服务，就往 `services` 里继续加——**一个进程全包，各自独立连接、独立重连**：
+
+```jsonc
+"services": [
+  { "room": "nas",   "target": "127.0.0.1:5244" },
+  { "room": "panel", "target": "127.0.0.1:10086", "targetTls": "insecure" },
+  { "room": "blog",  "target": "127.0.0.1:8080",
+    "secret": "这个服务单独用的密钥" }
+]
+```
+
+启动时会先把清单打出来，确认无误再建连：
+
+```
+config: mode=agent signal=mqtts://broker.emqx.io:8883 services=3
+  room nas              -> 127.0.0.1:5244
+  room panel            -> 127.0.0.1:10086 (tls:insecure)
+  room blog             -> 127.0.0.1:8080
 ```
 
 ### `room` 怎么填
@@ -60,6 +102,8 @@ cp agent.example.json agent.json
 | `https://nas.example.com/` | `nas` |
 | `https://files.example.com/` | `files` |
 
+**`room` 就是路由键**，所以「一个子域名 = 一个 service」。同一份配置里不能有重复的 `room`。
+
 如果引导页的 `config.js` 里写死了 `room`，以那里为准。
 
 ### `secret` 怎么填
@@ -68,6 +112,21 @@ cp agent.example.json agent.json
 
 它就是信令的共享密钥——用来推导 MQTT 主题（`SHA-256(room:secret)`）并签名每一条消息。
 两边不一致时，双方各自待在一个对方看不见的频道里，表现为**永远停在"正在建立 P2P 连接…"**。
+
+可以所有服务共用一条（个人使用没问题），也可以在每个 service 里写 `secret` 单独覆盖。
+
+### `targetTls` 怎么填
+
+**agent 到目标那一段默认是明文。** 浏览器到 agent 那段由 WebRTC 用 DTLS 1.3 加密，
+但目标是本机的一个端口，走什么协议由你决定：
+
+| 值 | 含义 | 什么时候用 |
+|---|---|---|
+| 不写 / `"off"` | 明文 | 目标说纯 HTTP（本机反代后面，最常见） |
+| `"insecure"` | TLS，**不验证证书** | 目标自带自签证书（面板类常见）。链路是加密的，**这是符合目的的默认** |
+| `"verify"` | TLS + 验证证书 | 还想发现"连错服务"。自签证书配 `targetTlsCA` |
+
+配错了不会莫名其妙：页面和 agent 控制台都会直接告诉你要加 `-target-tls insecure`。
 
 ---
 
@@ -108,14 +167,20 @@ https://你的域名/?key=<和 agent.json 里的 secret 一致>
 | `-mode` | `agent`（默认）/ `signal` / `stun-check` |
 | `-signal` | 信令地址 |
 | `-signal-kind` | 显式指定 `ws` 或 `mqtt`（留空按 scheme 推断） |
-| `-room` | 房间名 |
+| `-room` | 房间名（单服务形态） |
 | `-secret` | 访问密钥（mqtt 模式必填） |
-| `-target` | 本地 TCP 目标 |
+| `-target` | 本地 TCP 目标（单服务形态；多服务请写进配置文件） |
+| `-target-tls` | 回源 TLS：`off` / `insecure` / `verify` |
+| `-target-tls-ca` | 额外信任的根证书 PEM（配合 `verify`） |
+| `-target-tls-sni` | 覆盖 SNI 与校验用的名字 |
 | `-stun` | STUN 服务器。**会随 presence 公告下发给浏览器**，所以通常只要配这一处；传空字符串可禁用。逗号分隔可配多个，scheme 可省略 |
 | `-listen` | `signal` 模式的监听地址 |
 
+> 配置里用了 `services` 时，`-room` / `-target` / `-target-tls*` 会被拒绝而不是被忽略——
+> 静默无视一个参数正是这个项目一直在消灭的那种失败。
+
 **优先级：内置默认 → `agent.json` → 命令行参数。** 只有**显式传入**的参数才覆盖配置文件——
-所以固定配置写进 `agent.json` 之后，日常只需要 `./agent` 一条命令，
+所以固定配置写进 `agent.json` 之后，日常只需要 `./pinhole-agent` 一条命令，
 而且**密钥不会进 shell 历史**。
 
 ---

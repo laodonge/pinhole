@@ -76,6 +76,10 @@ function readBody(req) {
 
 function record(req, body) {
   stats.requests.push({
+    // Which listener received it. With several services forwarding to different
+    // targets, "it worked" is not enough — this is what proves the room routed
+    // to the target it was supposed to.
+    port: req.socket.localPort ?? null,
     method: req.method,
     url: req.url,
     cookie: req.headers.cookie ?? null,

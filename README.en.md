@@ -301,20 +301,79 @@ DTLS already covers.
 file, so once your settings live in `agent.json` the daily command is just `./agent` — **and the secret never
 lands in your shell history**.
 
-`agent.json` (copy from `agent.example.json`):
+`agent.json` (ships in the bundle — **just edit it**; `//` comments are allowed):
 
-```json
+```jsonc
 {
   "signal": "mqtts://broker.emqx.io:8883",
-  "room": "nas",
   "secret": "your access key",
-  "target": "127.0.0.1:5244",
+
+  // one subdomain = one service
+  "services": [
+    { "room": "nas",   "target": "127.0.0.1:5244" },
+    { "room": "panel", "target": "127.0.0.1:10086", "targetTls": "insecure" }
+  ],
+
   "stun": "stun:stun.miwifi.com:3478"
 }
 ```
 
+### One process, several services
+
+`room` is the **routing key** (the browser derives it from its own hostname: `nas.example.com` → `nas`),
+so each entry in `services` is "one subdomain → one local address". A single process serves all of them,
+**each connecting and reconnecting independently** — one service failing to connect cannot take the
+others down.
+
+The list is printed at startup, before anything connects, so you can check it:
+
+```
+config: mode=agent signal=mqtts://broker.emqx.io:8883 services=2
+  room nas              -> 127.0.0.1:5244
+  room panel            -> 127.0.0.1:10086 (tls:insecure)
+```
+
+Log lines carry the room, so one process is still readable:
+
+```
+[nas] connected to signaling, id=agent-90ddb672
+[panel] connected to signaling, id=agent-b17ae5f2
+```
+
+| Field | Required | Meaning |
+|---|---|---|
+| `room` | ✅ | Routing key; must equal the browser's first hostname label. Must be unique in one file |
+| `target` | ✅ | Local TCP address |
+| `targetTls` | | `off` (default) / `insecure` / `verify` — see above |
+| `targetTlsCA` / `targetTlsSNI` | | With `verify` |
+| `secret` | | Overrides the top-level one, to scope a key to a single service |
+
+> Only `room` and `target` are required. **The minimum service is one line.**
+
+The old single-service shape (top-level `room` + `target`) **still works** and is treated as a one-entry
+list — both shapes go through the same code path, so they cannot drift apart.
+
 **Signaling failures reconnect automatically** (exponential backoff capped at 30 s; reset once a session has
 been healthy for a minute), so a dropped broker connection does not leave your service dark.
+
+### Packaging it for somebody else's machine
+
+```bash
+npm run build                    # build the web shell first
+node scripts/package-agent.mjs   # writes release/*.zip
+```
+
+Each zip is **self-contained** — the recipient needs neither Node.js nor Go:
+
+```
+pinhole-agent        the binary
+agent.json           the config to edit (self-documenting)
+README.md            the deployment guide
+www/                 upload to your own static hosting
+```
+
+Five targets by default: `windows/amd64`, `linux/amd64`, `linux/arm64`, `darwin/arm64`, `darwin/amd64`.
+Use `--targets windows/amd64` for one, `--version x.y.z` to set the version.
 
 ### The agent hands its ICE configuration to the browser
 

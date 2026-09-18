@@ -128,6 +128,34 @@ type agentConfig struct {
 
 	// Listen is the self-hosted signaling server address (mode "signal").
 	Listen string `json:"listen"`
+
+	// Services exposes several targets from one process, each under its own
+	// room. A room is the routing key: the browser derives it from its hostname
+	// (`nas.example.com` -> `nas`), so one service per room per subdomain.
+	//
+	// When this is empty the top-level `room`/`target` are used instead, which
+	// is the original single-service shape and still works unchanged.
+	Services []serviceConfig `json:"services"`
+}
+
+// serviceConfig is one room-to-target mapping.
+type serviceConfig struct {
+	// Room is the channel name; the browser's hostname must match it.
+	Room string `json:"room"`
+
+	// Target is the local TCP service to expose.
+	Target string `json:"target"`
+
+	// TargetTLS / TargetTLSCA / TargetTLSSNI are per service, because one
+	// service may be plain HTTP while the next has its own certificate.
+	TargetTLS    string `json:"targetTls"`
+	TargetTLSCA  string `json:"targetTlsCA"`
+	TargetTLSSNI string `json:"targetTlsSNI"`
+
+	// Secret overrides the top-level one. Sharing a single key across your own
+	// services is fine; overriding per service lets a leaked key be scoped to
+	// one of them.
+	Secret string `json:"secret"`
 }
 
 func defaultAgentConfig() agentConfig {
@@ -142,6 +170,35 @@ func defaultAgentConfig() agentConfig {
 	}
 }
 
+// resolvedServices normalises the two configuration shapes into one list.
+//
+// The top-level room/target are treated as a single implicit service rather than
+// being kept as a parallel code path: every consumer then deals with one shape,
+// and the single-target case cannot drift away from the multi-target one.
+func (c agentConfig) resolvedServices() []serviceConfig {
+	if len(c.Services) > 0 {
+		out := make([]serviceConfig, 0, len(c.Services))
+		for _, svc := range c.Services {
+			if svc.Secret == "" {
+				svc.Secret = c.Secret
+			}
+			out = append(out, svc)
+		}
+		return out
+	}
+	if c.Room == "" && c.Target == "" {
+		return nil
+	}
+	return []serviceConfig{{
+		Room:         c.Room,
+		Target:       c.Target,
+		TargetTLS:    c.TargetTLS,
+		TargetTLSCA:  c.TargetTLSCA,
+		TargetTLSSNI: c.TargetTLSSNI,
+		Secret:       c.Secret,
+	}}
+}
+
 // loadAgentConfig merges a JSON file on top of cfg.
 //
 // explicit reports whether the path came from -config; a missing default file
@@ -154,10 +211,67 @@ func loadAgentConfig(path string, explicit bool, cfg *agentConfig) error {
 		}
 		return fmt.Errorf("read config %s: %w", path, err)
 	}
-	if err := json.Unmarshal(raw, cfg); err != nil {
+	// Comments are stripped so the shipped template can explain itself.
+	// `encoding/json` has no notion of them and a config file nobody dares edit
+	// is worse than no config file.
+	if err := json.Unmarshal(stripJSONComments(raw), cfg); err != nil {
 		return fmt.Errorf("parse config %s: %w", path, err)
 	}
 	return nil
+}
+
+// stripJSONComments removes // and /* */ comments from JSON-with-comments.
+//
+// A character scan rather than a regular expression, because strings are the
+// whole problem: every value in this project's own template contains `//` in
+// `mqtts://broker.emqx.io:8883`, and a regex would shred it. Escapes inside
+// strings are tracked so that a trailing `\"` does not end the string early.
+func stripJSONComments(in []byte) []byte {
+	out := make([]byte, 0, len(in))
+	inString := false
+	escaped := false
+
+	for i := 0; i < len(in); i++ {
+		c := in[i]
+
+		if inString {
+			out = append(out, c)
+			switch {
+			case escaped:
+				escaped = false
+			case c == '\\':
+				escaped = true
+			case c == '"':
+				inString = false
+			}
+			continue
+		}
+
+		switch {
+		case c == '"':
+			inString = true
+			out = append(out, c)
+		case c == '/' && i+1 < len(in) && in[i+1] == '/':
+			for i < len(in) && in[i] != '\n' {
+				i++
+			}
+			if i < len(in) {
+				out = append(out, '\n') // keep line numbering sane in errors
+			}
+		case c == '/' && i+1 < len(in) && in[i+1] == '*':
+			i += 2
+			for i+1 < len(in) && !(in[i] == '*' && in[i+1] == '/') {
+				if in[i] == '\n' {
+					out = append(out, '\n')
+				}
+				i++
+			}
+			i++ // the loop's own increment lands past the '/'
+		default:
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // applyFlags lets explicitly-passed flags win over the file. Only fields whose
@@ -218,30 +332,54 @@ func (c agentConfig) validate() error {
 	if c.Signal == "" {
 		return errors.New("no signaling endpoint: set \"signal\" in agent.json or pass -signal")
 	}
-	if c.Room == "" {
-		return errors.New("no room: set \"room\" in agent.json or pass -room\n" +
-			"  (it must match the browser's hostname first label, e.g. nas.example.com -> \"nas\")")
-	}
-	if c.Target == "" {
-		return errors.New("no target: set \"target\" in agent.json or pass -target")
-	}
-	if !validTargetTLSMode(c.TargetTLS) {
-		return fmt.Errorf("unknown -target-tls %q (want \"off\", \"insecure\", or \"verify\")", c.TargetTLS)
-	}
-	if c.TargetTLSCA != "" && c.TargetTLS != targetTLSVerify {
-		return errors.New("-target-tls-ca only applies with -target-tls verify")
-	}
-	if c.TargetTLSSNI != "" && (c.TargetTLS == "" || c.TargetTLS == "off") {
-		return errors.New("-target-tls-sni only applies with -target-tls set")
-	}
 
 	kind := resolveSignalKind(c.SignalKind, c.Signal)
 	if kind != "ws" && kind != "mqtt" {
 		return fmt.Errorf("unknown signal kind %q (want \"ws\" or \"mqtt\")", kind)
 	}
-	if kind == "mqtt" && c.Secret == "" {
-		return errors.New("mqtt signaling needs a secret: set \"secret\" in agent.json or pass -secret\n" +
-			"  (it must equal the access key you use in the browser's ?key=)")
+
+	services := c.resolvedServices()
+	if len(services) == 0 {
+		return errors.New("nothing to forward: set \"target\" (plus \"room\") in agent.json,\n" +
+			"  or list what you want under \"services\"")
 	}
+
+	// Every problem names the room it belongs to. With several services in one
+	// file, "no target" is not an actionable message on its own.
+	seen := make(map[string]bool, len(services))
+	for i, svc := range services {
+		where := svc.Room
+		if where == "" {
+			where = fmt.Sprintf("services[%d]", i)
+		}
+
+		if svc.Room == "" {
+			return fmt.Errorf("%s: no room\n"+
+				"  (a room must match the browser's hostname first label, e.g. nas.example.com -> \"nas\")", where)
+		}
+		if seen[svc.Room] {
+			return fmt.Errorf("room %q is listed twice — one room maps to one target", svc.Room)
+		}
+		seen[svc.Room] = true
+
+		if svc.Target == "" {
+			return fmt.Errorf("%s: no target", where)
+		}
+		if !validTargetTLSMode(svc.TargetTLS) {
+			return fmt.Errorf("%s: unknown targetTls %q (want \"off\", \"insecure\", or \"verify\")",
+				where, svc.TargetTLS)
+		}
+		if svc.TargetTLSCA != "" && svc.TargetTLS != targetTLSVerify {
+			return fmt.Errorf("%s: targetTlsCA only applies with targetTls \"verify\"", where)
+		}
+		if svc.TargetTLSSNI != "" && (svc.TargetTLS == "" || svc.TargetTLS == "off") {
+			return fmt.Errorf("%s: targetTlsSNI only applies when targetTls is set", where)
+		}
+		if kind == "mqtt" && svc.Secret == "" {
+			return fmt.Errorf("%s: mqtt signaling needs a secret\n"+
+				"  (set \"secret\" at the top level, or per service; it must equal the browser's ?key=)", where)
+		}
+	}
+
 	return nil
 }

@@ -292,20 +292,78 @@ go run ./packages/agent \
 **优先级：内置默认 → `agent.json` → 命令行参数。** 只有**显式传入**的参数才覆盖配置文件，
 所以一个固定配置写进 `agent.json` 之后就只需要 `./agent` 一条命令——而且密钥不会进 shell 历史。
 
-`agent.json`（从 `agent.example.json` 复制）：
+`agent.json`（包里自带，**直接改就行**，支持 `//` 注释）：
 
-```json
+```jsonc
 {
   "signal": "mqtts://broker.emqx.io:8883",
-  "room": "nas",
   "secret": "换成你的访问密钥",
-  "target": "127.0.0.1:5244",
+
+  // 一个子域名 = 一个 service
+  "services": [
+    { "room": "nas",   "target": "127.0.0.1:5244" },
+    { "room": "panel", "target": "127.0.0.1:10086", "targetTls": "insecure" }
+  ],
+
   "stun": "stun:stun.miwifi.com:3478"
 }
 ```
 
+### 一个进程转发多个服务
+
+`room` 是**路由键**（浏览器从自己的域名推导：`nas.example.com` → `nas`），所以 `services` 里
+每一项就是"一个子域名 → 一个本机地址"。一个进程全包，**各自独立建连、独立重连**，
+一个服务连不上不会拖垮其他服务。
+
+启动时会先把清单打出来，确认无误再建连：
+
+```
+config: mode=agent signal=mqtts://broker.emqx.io:8883 services=2
+  room nas              -> 127.0.0.1:5244
+  room panel            -> 127.0.0.1:10086 (tls:insecure)
+```
+
+每个服务的日志都带房间前缀，一个进程也能看懂：
+
+```
+[nas] connected to signaling, id=agent-90ddb672
+[panel] connected to signaling, id=agent-b17ae5f2
+```
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `room` | ✅ | 路由键，要等于浏览器的域名首段。同一份配置里不能重复 |
+| `target` | ✅ | 本机 TCP 地址 |
+| `targetTls` | | `off`（默认）/ `insecure` / `verify`，见上文 |
+| `targetTlsCA` / `targetTlsSNI` | | 配合 `verify` |
+| `secret` | | 覆盖顶层的那一条（想给某个服务单独一把钥匙时用） |
+
+> 只有 `room` / `target` 是必需的。**一个服务的最简配置就是一行。**
+
+旧的单服务写法（顶层 `room` + `target`）**仍然有效**，会被当成只有一个 service——
+两种形态在代码里走同一条路径，不会各自漂移。
+
 **信令断开会自动重连**（指数退避，上限 30 秒；连接稳定超过 1 分钟则重置退避），
 所以公共 broker 被网络中断不会让服务一直暗着。
+
+### 打包给别人的机器用
+
+```bash
+npm run build                    # 先构建 web 外壳
+node scripts/package-agent.mjs   # 产出 release/*.zip
+```
+
+每个 zip 是**自足的**——对方不需要 Node.js 或 Go：
+
+```
+pinhole-agent        程序本体
+agent.json           要改的配置（自带注释）
+README.md            部署指南
+www/                 传到自己的静态托管
+```
+
+默认出五个平台：`windows/amd64`、`linux/amd64`、`linux/arm64`、`darwin/arm64`、`darwin/amd64`。
+用 `--targets windows/amd64` 只出一个，`--version x.y.z` 指定版本号。
 
 ### ICE 配置由 agent 下发给浏览器
 

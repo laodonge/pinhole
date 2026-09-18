@@ -82,7 +82,7 @@ func (f *fakeSignaling) messages() []SignalMessage {
 func TestPresenceMessageCarriesICEServers(t *testing.T) {
 	// Bare "host:port", as a user might write it: the announced value must come
 	// back with the scheme Pion and the browser both require.
-	agent := NewAgent("127.0.0.1:9", plainDialer("127.0.0.1:9"), "", "stun.miwifi.com:3478,turn:turn.example.com:3478")
+	agent := NewAgent(serviceConfig{Room: "test", Target: "127.0.0.1:9"}, plainDialer("127.0.0.1:9"), "stun.miwifi.com:3478,turn:turn.example.com:3478")
 
 	msg := agent.presenceMessage("agent-test")
 
@@ -103,7 +103,7 @@ func TestPresenceMessageCarriesICEServers(t *testing.T) {
 }
 
 func TestPresenceMessageOmitsICEServersWhenUnset(t *testing.T) {
-	agent := NewAgent("127.0.0.1:9", plainDialer("127.0.0.1:9"), "", "")
+	agent := NewAgent(serviceConfig{Room: "test", Target: "127.0.0.1:9"}, plainDialer("127.0.0.1:9"), "")
 
 	msg := agent.presenceMessage("agent-test")
 
@@ -119,7 +119,7 @@ func TestPresenceMessageOmitsICEServersWhenUnset(t *testing.T) {
 // waiting a full interval: the fake fails its second Send, so the loop returns.
 func TestAnnounceLoopSendsImmediately(t *testing.T) {
 	fake := &fakeSignaling{id: "agent-test", maxSends: 1}
-	agent := NewAgent("127.0.0.1:9", plainDialer("127.0.0.1:9"), "", "stun.miwifi.com:3478")
+	agent := NewAgent(serviceConfig{Room: "test", Target: "127.0.0.1:9"}, plainDialer("127.0.0.1:9"), "stun.miwifi.com:3478")
 
 	go agent.announceLoop(fake)
 
