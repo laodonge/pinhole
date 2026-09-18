@@ -57,8 +57,26 @@ export class PinholeTunnelElement extends HTMLElement {
   private signalClient: SignalingChannel | null = null;
   private tunnel: Tunnel | null = null;
   private swRegistration: ServiceWorkerRegistration | null = null;
-  /** Hostnames to intercept, applied only while the tunnel is up. */
-  private interceptDomains: string[] = [];
+  /**
+   * Hostnames to intercept.
+   *
+   * Always this document's own hostname, and deliberately not configurable. A
+   * Service Worker can only intercept requests to its own origin, so the list
+   * could never legitimately contain anything else — and setting it wrong
+   * silently disables interception entirely, which looks exactly like the
+   * network being broken.
+   */
+  private get interceptDomains(): string[] {
+    return [location.hostname];
+  }
+  /**
+   * The `Host` to present upstream, or null to use the request's own.
+   *
+   * The *identity* the tunnel visits as. It comes from the page — how it is
+   * chosen is the page's policy — and it is the one thing the component needs
+   * settled besides `room`, because a reverse proxy routes on it.
+   */
+  private upstreamHost: string | null = null;
   /**
    * Paths the worker must never proxy — the shell's own files.
    *
@@ -241,10 +259,11 @@ export class PinholeTunnelElement extends HTMLElement {
       );
     }
 
-    this.interceptDomains = (this.getAttribute("domain") ?? "")
-      .split(",")
-      .map((d) => d.trim())
-      .filter(Boolean);
+    // The identity to present upstream. Absent means "the request's own host",
+    // which is the right answer whenever the shell is served from the same
+    // hostname as the site — the common case, and the only one where absolute
+    // URLs in the service cannot escape the tunnel.
+    this.upstreamHost = this.getAttribute("domain")?.trim() || null;
 
     const passthrough = this.getAttribute("passthrough");
     if (passthrough) {
@@ -385,7 +404,7 @@ export class PinholeTunnelElement extends HTMLElement {
     }
 
     try {
-      const reqBytes = encodeRequest(method, url, headers, body);
+      const reqBytes = encodeRequest(method, url, headers, body, this.upstreamHost);
       const stream = await this.tunnel!.request(reqBytes);
       const { meta, body: bodyStream } = await splitResponse(stream);
 
@@ -645,7 +664,9 @@ export class PinholeTunnelElement extends HTMLElement {
             this.wsSessions.delete(msg.id);
             port.postMessage({ t: "close", id: msg.id, code, reason, wasClean });
           },
+          // The identity to present upstream, settled by the page.
         },
+        this.upstreamHost,
       );
 
       this.wsSessions.set(msg.id, { raw, port });

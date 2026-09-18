@@ -58,18 +58,29 @@ export function removeHeader(
   return headers.filter(([k]) => k.toLowerCase() !== lower);
 }
 
+/**
+ * Serialise a request as HTTP/1.1 bytes.
+ *
+ * `host` overrides the `Host` header. It is the *identity* the tunnel presents,
+ * which is a decision belonging to the page that embedded the component, not to
+ * the component: the browser's own hostname is only the identity when the shell
+ * is served from the same hostname as the site. When it is not — a single shell
+ * hostname presenting several sites — the page says so here and the reverse
+ * proxy can still route by `Host`.
+ */
 export function encodeRequest(
   method: string,
   url: string,
   headers: Record<string, string>,
   body: Uint8Array,
+  host?: string | null,
 ): Uint8Array {
   const u = new URL(url);
   const path = u.pathname + u.search;
 
   const lines = [
     `${method} ${path} HTTP/1.1`,
-    `Host: ${u.host}`,
+    `Host: ${host || u.host}`,
     "Connection: close",
   ];
   for (const [k, v] of Object.entries(headers)) {

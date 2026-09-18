@@ -114,20 +114,27 @@ export async function acceptFor(key: string): Promise<string> {
   return toBase64(new Uint8Array(digest));
 }
 
-/** Build the HTTP/1.1 upgrade request (§4.1). */
+/**
+ * Build the HTTP/1.1 upgrade request (§4.1).
+ *
+ * `host` overrides the `Host` header, for the same reason `encodeRequest` takes
+ * one: the identity presented upstream is the embedding page's decision, and a
+ * websocket handshake has no request headers of its own to inherit it from.
+ */
 export function buildHandshake(
   url: string,
   key: string,
   protocols: string[],
   headers: Record<string, string>,
   origin: string,
+  host?: string | null,
 ): Uint8Array {
   const u = new URL(url);
   const path = u.pathname + u.search;
 
   const lines = [
     `GET ${path} HTTP/1.1`,
-    `Host: ${u.host}`,
+    `Host: ${host || u.host}`,
     "Upgrade: websocket",
     "Connection: Upgrade",
     `Sec-WebSocket-Key: ${key}`,
@@ -226,6 +233,8 @@ export class RawWebSocket {
     private readonly origin: string,
     private readonly binaryType: "blob" | "arraybuffer",
     private readonly events: WsEvents,
+    /** The `Host` to present upstream; defaults to the URL's own. */
+    private readonly host: string | null = null,
   ) {
     void this.run();
   }
@@ -257,7 +266,7 @@ export class RawWebSocket {
       key = randomKey();
       this.accepted = await acceptFor(key);
       this.pipe.send(
-        buildHandshake(this.url, key, this.protocols, this.headers, this.origin),
+        buildHandshake(this.url, key, this.protocols, this.headers, this.origin, this.host),
       );
     } catch (e) {
       this.fail(String(e));

@@ -27,6 +27,12 @@ interface EtConfig {
   /** Derive the room from the hostname instead of stating it. */
   roomFromHostname?: boolean;
   rootDomain?: string;
+  /**
+   * The identity to present upstream, when it should differ from this page's own
+   * hostname. Absent means "use the request's own host" — correct whenever the
+   * shell is served from the same hostname as the site.
+   */
+  domain?: string;
   keyParam?: string;
   keyStorageKey?: string;
   /** Keep the screen awake while connected (opt-in; drains battery). */
@@ -176,10 +182,24 @@ function start(): void {
   const rows: Array<{ k: string; v: string; level?: Level }> = [
     { k: "域名", v: host },
     { k: "房间", v: room ?? "(未配置)", level: room ? undefined : "bad" },
+  ];
+
+  // Report the identity mismatch; the escape it implies is the page's problem to
+  // explain, not the component's to paper over.
+  const identity = config.domain?.trim();
+  if (identity && identity !== host) {
+    rows.push({
+      k: "身份",
+      v: `${identity}（≠ 当前域名，应用里写死的绝对 URL 会绕过隧道）`,
+      level: "warn",
+    });
+  }
+
+  rows.push(
     { k: "信令", v: `${signalKind} · ${signal}` },
     { k: "密钥", v: fingerprint(key ?? ""), level: key ? "ok" : "bad" },
     { k: "状态", v: "连接信令中…", level: "warn" },
-  ];
+  );
   const setState = (value: string, level: Level): void => {
     rows[rows.length - 1] = { k: "状态", v: value, level };
     setDiag(rows);
@@ -254,8 +274,9 @@ function start(): void {
   tunnel.setAttribute("signal-kind", signalKind);
   tunnel.setAttribute("room", room);
   tunnel.setAttribute("secret", key);
-  tunnel.setAttribute("domain", host);
   tunnel.setAttribute("stun", config.stun ?? DEFAULT_STUN);
+  // 身份由这个页面决定并交给组件；不填就是"用请求自己的 Host"。
+  if (config.domain) tunnel.setAttribute("domain", config.domain);
   if (config.wakeLock) tunnel.setAttribute("wake-lock", "");
 
   tunnel.addEventListener("signaling-ready", () => {

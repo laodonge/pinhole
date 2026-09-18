@@ -192,6 +192,47 @@ https://你的域名/?key=<和 agent.json 里的 secret 一致>
 
 > 反过来，如果你有**两台机器**，那就是两个 `room`，各自指向自己那台的 nginx。
 
+### 页面负责把域名拆成 `room` 和 `domain`
+
+组件只接受**已经确定**的这两个值，怎么算出来是页面的策略。两种常见策略：
+
+| 子域名的作用 | 页面怎么做 | `config.js` | `agent.json` |
+|---|---|---|---|
+| **选不同的机器**（共用静态托管） | 把子域名拆成 room 和身份 | `roomFromHostname: true` | 每台机器各一份，room = 子域名 |
+| **选同一台机器上的不同站点** | 固定一个 room，站点交给 nginx | `room: "home"` | 一份，指向那台的 nginx |
+
+**第一种**（`nas.example.com` 打到 NAS、`vps.example.com` 打到 VPS，共用一份静态托管）：
+
+```javascript
+// 所有子域名共用这一份 config.js
+roomFromHostname: true,          // nas.example.com → room "nas"
+// rootDomain: "example.com",    // 子域名本身带点时填
+```
+```jsonc
+// NAS 上那份 agent.json
+"services": [ { "room": "nas", "target": "127.0.0.1:80" } ]
+// VPS 上那份
+"services": [ { "room": "vps", "target": "127.0.0.1:80" } ]
+```
+
+**第二种**（三站点都在一台机器上）：`room: "home"`，`services` 只指向那台的 nginx，
+加站点只改 nginx。**这是站点多起来之后更省事的那种**，因为 `room` 不用跟着站点数增长。
+
+### 外壳和站点不同域名时：填 `domain`
+
+身份默认是**请求自己的 Host**——外壳和站点同域名时，这就是对的，也**不需要填任何东西**。
+
+只有外壳和站点**不同域名**时才填（比如外壳放在托管商给的免费域名上）：
+
+```javascript
+room: "home",
+domain: "nas.example.com",       // ← 以这个身份访问
+```
+
+这时页面的诊断面板会自己挂一行提醒，因为**应用里写死的绝对 URL 会绕过隧道**（见下）。
+相对 URL、以及从 `location` 推导 URL 的应用（1Panel 就是）不受影响。
+
+
 ### 什么不属于 pinhole
 
 明确写下来，免得后面有人指望它兜底：

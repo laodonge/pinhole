@@ -64,6 +64,21 @@ window.__ET_CONFIG = {
    */
   // rootDomain: "example.com",
 
+  /**
+   * 以什么身份去访问目标 —— **一般不用填**。
+   *
+   * 不填 = 用请求自己的 Host。这是最常见也最稳的形态：
+   * 外壳和站点在同一个域名上，于是应用里的绝对 URL 也是同源的，不会绕过隧道。
+   *
+   * 只有在外壳和站点**不同域名**时才填（比如外壳在托管商给的免费域名上）：
+   *
+   *   domain: "nas.example.com",
+   *
+   * ⚠️ 填了之后身份就和当前域名不一致了，应用里**写死的绝对 URL**
+   *    （指向 nas.example.com 的那些）会绕过隧道直连公网。相对 URL 不受影响。
+   */
+  // domain: "nas.example.com",
+
   /** 首次访问时携带密钥的参数名与 localStorage 键名。一般不用改。 */
   keyParam: "key",
   keyStorageKey: "pinhole-key",

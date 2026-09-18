@@ -664,7 +664,12 @@ const shell = http.createServer(async (req, res) => {
           body,
           Buffer.from(
             `\nwindow.__ET_CONFIG.room = ${JSON.stringify(process.env.PIN_ROOM)};` +
-              `\ndelete window.__ET_CONFIG.roomFromHostname;\n`,
+              `\ndelete window.__ET_CONFIG.roomFromHostname;` +
+              // PIN_DOMAIN exercises the identity override: the page's hostname
+              // stays localhost, but the target should see something else.
+              (process.env.PIN_DOMAIN
+                ? `\nwindow.__ET_CONFIG.domain = ${JSON.stringify(process.env.PIN_DOMAIN)};\n`
+                : "\n"),
           ),
         ]);
       } else {
