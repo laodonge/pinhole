@@ -537,37 +537,61 @@ async function httpChecks() {
     eq("target cookie (HttpOnly) round trip", seen.indexOf("tunnel_secret=hidden") !== -1, true);
   } catch (e) { log("FAIL set-cookies threw: " + e); }
 
-  // 13. the app registering its own service worker at scope "/". Common in SPAs,
-  // and the scope is the one the tunnel needs — so this asks whether the tunnel
-  // survives being displaced.
+  // 13. Can the app displace the tunnel by registering its own service worker at
+  // scope "/"? It cannot, and the reason is structural rather than lucky: the
+  // browser fetches a worker *script* itself, so that one fetch bypasses every
+  // service worker, including this one. It goes to the static host, where
+  // /app-sw.js does not exist (the mock only serves it on the far side of the
+  // tunnel), so registration dies with a 404.
+  //
+  // This is asserted as "registration fails" on purpose. The old assertion here
+  // was "the tunnel still works afterwards", which passed for the wrong reason:
+  // no worker was ever installed, so there was nothing to survive. An assertion
+  // that passes when the mechanism under test never ran is worse than no
+  // assertion — it reports coverage that does not exist.
+  //
+  // The price is real and is documented: an app that needs its own service
+  // worker — offline/PWA, push, background sync, a cache-first asset strategy —
+  // cannot have one here.
   try {
     const reg = await navigator.serviceWorker.register("/app-sw.js", { scope: "/" });
-    log("app registered its own SW: " + (reg.active?.scriptURL ?? reg.installing?.scriptURL ?? "pending"));
+    const live = reg.active?.scriptURL ?? reg.installing?.scriptURL ?? "pending";
+    log("FAIL app SW registration unexpectedly succeeded: " + live);
+    eq("an app cannot register its own SW", false, true);
   } catch (e) {
-    log("app SW registration threw: " + e);
+    // The 404 is the point: it proves the script fetch went to the static host
+    // instead of through the tunnel, where that path would have answered 200.
+    eq("app SW registration fails with a 404", /404/.test(String(e)), true);
   }
-  await new Promise(function (r) { setTimeout(r, 800); });
+
+  // ...and the tunnel is still the one answering.
   try {
     const r = await fetchT("/api/http/text");
     const t = await r.text();
-    eq("tunnel survives an app-registered SW", t === TEXT, true);
+    eq("tunnel still answering after the app SW attempt", t === TEXT, true);
   } catch (e) {
     log("FAIL after app SW: " + e);
   }
 
-  // 14. Could the whole thing ship as one file? That depends on whether a Service
-  // Worker can be registered from a blob URL — the SW script is the one piece that
-  // cannot be inlined into the page. Narrow scope on purpose: if this somehow
-  // succeeds it must not disturb the tunnel's own registration.
+  // 14. Can the whole thing ship as one self-contained file? No. A service worker
+  // script must be fetched over http(s) from the worker's own origin, so the one
+  // piece that cannot be inlined into the page also cannot be handed to the
+  // browser as a blob: URL. sw.js has to be a real, separately served file —
+  // the floor for this project is two files (index.html + sw.js), not one.
+  //
+  // Asserted because it is a *platform* limit, not an implementation detail: if a
+  // future browser lifts it, single-file bootstrapping becomes possible and this
+  // check is how anyone would find out.
   try {
     const blob = new Blob(["self.addEventListener('install', () => self.skipWaiting());\\n"], {
       type: "text/javascript",
     });
     const url = URL.createObjectURL(blob);
     const reg = await navigator.serviceWorker.register(url, { scope: "/__blob-sw/" });
-    log("blob SW registered: " + (reg.active?.scriptURL ?? "pending"));
+    log("FAIL blob SW registration unexpectedly succeeded: " + (reg.active?.scriptURL ?? "pending"));
+    eq("a SW cannot be registered from a blob URL", false, true);
   } catch (e) {
-    log("blob SW rejected: " + e.name + " — " + e.message);
+    eq("a SW cannot be registered from a blob URL", /protocol/i.test(String(e)), true);
   }
 }
 
