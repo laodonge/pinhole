@@ -854,9 +854,50 @@ if it only speaks TLS, restart the agent with `-target-tls insecure`
 > Each hint is logged once per process — per request would flood the log, and a hint nobody reads is
 > not a hint.
 
-Measured: the whole conformance suite (22 HTTP checks plus 5 WebSocket checks) re-run against a TLS
+Measured: the whole conformance suite (33 HTTP checks plus 5 WebSocket checks) re-run against a TLS
 target passes unchanged — not one line changed on the browser side, because the TLS lives entirely in
 the agent.
+
+---
+
+### 2.18 The four boundaries of being a page proxy — none of them visible in the code
+
+Taking "the component must support everything a page can do" as the acceptance test turned up four
+bugs, and **not one of them could be seen in the source**. What they share: **the failure looks like
+something else**.
+
+| | Symptom | What was really happening | Fix |
+|---|---|---|---|
+| **① Framing refusal** | the iframe is blank, **indistinguishable from a dead tunnel** | the target sends `X-Frame-Options: DENY` or CSP `frame-ancestors 'none'`; the shell renders every service in an iframe, so "refuses to be framed" means "refuses to be shown" | delete `X-Frame-Options` outright; from the CSP remove **only** the `frame-ancestors` directive (`script-src` is the app's own defence and is not ours to discard) |
+| **② Headers lost in silence** | the target sees an **anonymous request**, which reads as "the app is broken" | `Referer` / `Origin` / `Accept-Language` are forbidden header names, hidden from the worker — and the worker *rebuilds* the request, so what it cannot see never crosses | rebuild those three (`navigator.languages`; the initiating frame's URL). **`Sec-Fetch-*` is deliberately not forged**: it is a security signal the browser computes, and writing `same-origin` by hand would fake an answer to a question that deserves a real one |
+| **③ Cancels never arrive** | **no symptom at all**: the target keeps writing into a socket nobody reads | two independent causes stacked. The worker side was correct (the stream's `cancel()` does fire); the component cancelled the **raw stream** `request()` returns — already locked by `splitResponse`, so `cancel()` threw `Cannot cancel a locked stream` and **failed silently** | aim the cancel at **whichever stream is currently being drained**, re-pointed at each stage |
+| **④ A comment that lied** | it looked implemented | the comment claimed the worker scope's `cookieStore` includes `HttpOnly`; **measurement says it does not** | the comment now says what was measured; `HttpOnly` is carried by the jar (read from `Set-Cookie` in the response head), not by `cookieStore` |
+
+**③ has a platform boundary worth recording separately:**
+
+| When the cancel happens | Does the target find out? | Basis |
+|---|:---:|---|
+| **After** the response head arrives | ✅ | the browser calls `cancel()` on the stream we returned |
+| **Before** the response head arrives | ❌ | `FetchEvent.request.signal` **never fired**. The documentation says it should, [and so does Chrome's own blog post](https://developer.chrome.com/blog/abortable-fetch/), but repeated measurement on this Chrome 153 says otherwise |
+
+Both hooks are wired, so whichever works is enough. **The first case is only logged by the harness,
+never asserted** — the day the platform fixes it, that number goes from 0 to 1 by itself.
+
+### Two impossibilities, recorded in the same place
+
+| | Why it cannot work |
+|---|---|
+| **An app's own Service Worker** | the browser fetches a worker script **past every service worker** (or it would be self-referential), so the request lands on the static host and always 404s. No PWA offline, no push, no background sync. **The side effect is good**: the tunnel cannot be displaced by the app |
+| **A single-file build** | a worker script must be fetched over http(s) from its **own origin**; `blob:` is rejected (`The URL protocol of the script is not supported`). The floor is two files: `index.html` + `sw.js` |
+
+> **The lesson, worth more than the four bugs**: **"it should work like this" is not evidence; "what
+> the target received" is.**
+>
+> Three of these four were perfectly self-consistent at the source level: the code really does forward
+> every request header, really does call `cancel()`, and the comment really does claim `HttpOnly`
+> works. The only way through was **to ask the other end** — dump the headers the target received
+> verbatim, and count on the target when its socket closed. That "the far side decides" check is now
+> part of the harness (see the [capability matrix](CAPABILITIES.en.md)).
 
 ---
 

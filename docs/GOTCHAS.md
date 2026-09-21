@@ -844,8 +844,44 @@ if it only speaks TLS, restart the agent with `-target-tls insecure`
 > **教训**：**"连上了但什么都没说"本身就是一个诊断信号。** 零字节和"收到了一堆解析不了的东西"是两种不同的病，
 > 分开报，用户才知道该改什么。提示每个进程只打一次——按请求打会刷屏，而会刷屏的提示没人看。
 
-实测：把整套一致性用例（HTTP 22 项 + WebSocket 5 项）原样换成 TLS 目标复跑，**全部通过**——
+实测：把整套一致性用例（HTTP 33 项 + WebSocket 5 项）原样换成 TLS 目标复跑，**全部通过**——
 浏览器侧一行都没改，因为 TLS 完全在 agent 里。
+
+---
+
+### 2.18 页面代理的四条边界：全都"读代码看不出来"
+
+把「组件要支持页面能做的一切」当验收标准之后，这一轮找出四个 bug，**没有一个能从源码里看出来**。
+它们的共同点是：**失败长成了别的东西的样子**。
+
+| | 症状 | 真相 | 修法 |
+|---|---|---|---|
+| **① 帧拒绝** | iframe 一片空白，**和隧道断了长得一模一样** | 目标是 `X-Frame-Options: DENY` 或 CSP `frame-ancestors 'none'`；外壳把服务渲染在 iframe 里，于是"拒绝被 frame"＝"拒绝被显示" | 整条删掉 `X-Frame-Options`；CSP **只**去掉 `frame-ancestors` 这一条指令（`script-src` 是应用自己的防线，不能丢） |
+| **② 请求头静默丢失** | 目标收到的是**匿名请求**，看着像"应用有 bug" | `Referer` / `Origin` / `Accept-Language` 都是 forbidden header name，浏览器对 worker 隐藏；而 worker 是**重建**请求的，看不见就传不过去 | 重建这三个（`navigator.languages`、发起请求的 frame 的 URL）。**`Sec-Fetch-*` 故意不伪造**——那是浏览器计算出的安全信号，手写 `same-origin` 是拿伪造去糊弄一个本该被回答的问题 |
+| **③ 取消传不到目标** | **完全没有症状**：目标继续往没人读的 socket 里写 | 两个独立原因叠在一起。worker 侧没错（流的 `cancel()` 会触发），错在组件取消的是 `request()` 返回的**原始流**——它已被 `splitResponse` 锁住，`cancel()` 抛 `Cannot cancel a locked stream`，于是**静默失败** | 取消瞄准**当前正在被消费的那个流**，每推进一个阶段就重新指向 |
+| **④ 注释撒谎** | 看起来"已经实现了" | 注释写"worker 作用域里 `cookieStore` 包含 `HttpOnly`"，**实测不包含** | 注释改成实测结论；`HttpOnly` 靠 jar（从响应头的 `Set-Cookie` 读）而不是靠 `cookieStore` |
+
+**③ 还有一个平台边界，值得单独记**：
+
+| 取消的时机 | 目标是否知道 | 依据 |
+|---|:---:|---|
+| 响应头**到达之后** | ✅ | 浏览器会调用我们返回的流的 `cancel()` |
+| 响应头**到达之前** | ❌ | `FetchEvent.request.signal` **没有触发**。文档说会触发，[Chrome 的博客也这么写](https://developer.chrome.com/blog/abortable-fetch/)，但这台 Chrome 153 上反复实测都没有 |
+
+两个钩子都接上，哪个能用用哪个。**前一种情况在 harness 里只记录不断言**——平台一旦修好，那个数字会自己从 0 变成 1。
+
+### 两条"不可能"，也一起记在这里
+
+| | 为什么不可能 |
+|---|---|
+| **应用自带的 Service Worker** | 浏览器抓 SW 脚本时**绕过所有 SW**（否则自我引用），请求落到静态托管上必然 404。PWA 离线、推送、后台同步全都用不了。**副作用是好的**：隧道不可能被应用顶掉 |
+| **单文件自举** | SW 脚本必须由 http(s) 从**自己的源**取；`blob:` 被拒绝（`The URL protocol of the script is not supported`）。所以下限是两个文件：`index.html` + `sw.js` |
+
+> **教训（这一条比上面四个都值钱）**：**"它应该是这样"不是证据，"目标收到了什么"才是。**
+>
+> 这四个 bug 里有三个在源码层面完全自洽：代码确实转发了所有请求头、确实调用了 `cancel()`、注释确实声称拿到了 `HttpOnly`。
+> 唯一的破法是**去问另一头**——在目标侧把收到的请求头原样打出来、在目标侧数 socket 什么时候关的。
+> 这套"另一头说了算"的检查现在是 harness 的一部分（见 [能力矩阵](CAPABILITIES.md)）。
 
 ---
 

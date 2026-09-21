@@ -118,7 +118,7 @@ The full reasoning is in **[docs/GOTCHAS.en.md § 6](docs/GOTCHAS.en.md)**.
 | **Chunked / compressed responses** | Not stated | ✅ Dechunked, decompressed, and gzip is negotiated proactively ([§2.15](docs/GOTCHAS.en.md)) |
 | **Protocols once a CLI is installed** | **Any TCP + UDP** (`internal/proxy/tcp.go`, `udp.go`) | Not offered — pinhole has no CLI-client side |
 | Docker / TUI | ✅ Docker sidecar isolation, live TUI | ❌ |
-| Documentation | README + a configuration guide | **39 documented traps** ("symptom → cause → fix → how we found out") + measured numbers |
+| Documentation | README + a configuration guide | **38 numbered traps** ("symptom → cause → fix → how we found out", see the [capability matrix](docs/CAPABILITIES.en.md)) + measured numbers |
 | Activity | 3 commits over 0.8 h, untouched since, 1 star | Runs on real hardware, with measured numbers |
 
 **What we learned from BTunnel** (the first four are places it is ahead of pinhole; the fifth is now done):
