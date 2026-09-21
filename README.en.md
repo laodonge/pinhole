@@ -478,10 +478,18 @@ npm run test:mqtt --workspace @pinhole/component
 | Anything with a web shell (webssh / noVNC / a DB admin panel) | ✅ | Just expose it over HTTP |
 | Large downloads | ⚠️ | Requires **resume** — see "the most important boundary" below. Streaming, backpressure and 16 KB chunking are implemented |
 | **Range requests / resumable downloads** | ✅ | 206 / `Content-Range` / 416 pass through end to end, `Accept-Ranges` is readable; the SW exposes the relevant headers (see [GOTCHAS §2.2](docs/GOTCHAS.en.md)) |
-| **Transparent WebSocket proxying** | ❌ | **A Service Worker cannot intercept a WS upgrade**; the page needs a shim |
+| **Transparent WebSocket proxying** | ✅ | A SW cannot intercept a WS upgrade, so the shim is **injected into the proxied page** and implements RFC 6455 itself ([§2.1](docs/GOTCHAS.en.md)) |
+| **SSE / `EventSource` streaming** | ✅ | A streaming response with no `Content-Length` at all arrives event by event (measured) |
+| **Web Worker scripts** | ✅ | A worker script fetch **does** go through the SW — the exact opposite of a service worker script (measured) |
+| **Sites that refuse to be framed** | ✅ | `X-Frame-Options` and CSP `frame-ancestors` are stripped; left in place the shell's iframe goes blank, which looks exactly like the tunnel being down |
+| **Cancelling a download** | ⚠️ | A cancel **after** the response head does reach the target and closes the connection; **before** it, it cannot — the browser reports nothing |
+| **An app's own Service Worker** | ❌ | The browser fetches a SW script past every SW, so registration always gets a 404 — no PWA offline, push, or background sync |
+| **Uploading large files** | ⚠️ | The request body is buffered whole in the SW first; memory cost ≈ file size |
 | Arbitrary native TCP (an SSH client, a game) | ❌ | Browsers have no socket API |
 | Type-the-address access | ⚠️ | In-page fetches are already transparent; **the address bar needs a real wildcard domain plus the bootstrap page** |
 | **Unattended long transfers** | ❌ | The tunnel lives in the page; freezing it kills the transfer — a relay is the better tool |
+
+Every row, how it was measured, and why the impossible ones cannot be fixed: **[docs/CAPABILITIES.en.md](docs/CAPABILITIES.en.md)**.
 
 ### ⚠️ The most important boundary: it is *session-scoped*, not *task-scoped*
 

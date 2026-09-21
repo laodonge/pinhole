@@ -461,10 +461,18 @@ npm run test:mqtt --workspace @pinhole/component
 | 有 Web 外壳的服务（webssh / noVNC / 数据库面板） | ✅ | 服务端用 HTTP 暴露即可 |
 | 大文件下载 | ⚠️ | 需要配合**续传**使用——见下方「最重要的边界」。流式 + 背压 + 16 KB 分块已实现 |
 | **Range 请求 / 断点续传** | ✅ | 206 / `Content-Range` / 416 全链路透传，`Accept-Ranges` 可读；SW 已暴露相关头（见 [踩坑文档 §2.2](docs/GOTCHAS.md#22-range-请求不是可选优化)） |
-| **WebSocket 透明代理** | ❌ | **Service Worker 拦不到 WS 升级**，需要页面用 shim |
+| **WebSocket 透明代理** | ✅ | SW 拦不到 WS 升级，所以垫片**注入被代理的页面**并自己实现 RFC 6455（[§2.1](docs/GOTCHAS.md#21-service-worker-拦不到-websocket透明化要绕一大圈)） |
+| **SSE / `EventSource` 流式** | ✅ | 完全没有 `Content-Length` 的流式响应逐条到达（实测） |
+| **Web Worker 脚本** | ✅ | Worker 脚本抓取**会**经过 SW——和 Service Worker 脚本刚好相反（实测） |
+| **拒绝被 frame 的站点** | ✅ | `X-Frame-Options` 与 CSP `frame-ancestors` 会被剥掉；不剥的话外壳的 iframe 一片空白，且看起来和「隧道断了」一模一样 |
+| **取消下载** | ⚠️ | 响应头到达**之后**的取消会传到目标（连接真的关掉）；**到达之前不能**，浏览器不上报 |
+| **应用自带的 Service Worker** | ❌ | 浏览器抓 SW 脚本时绕过所有 SW，登记必然拿到 404——PWA 离线、推送、后台同步都用不了 |
+| **上传大文件** | ⚠️ | 请求体会先在 SW 里整个缓冲，内存开销 ≈ 文件大小 |
 | 任意原生 TCP（SSH 客户端、游戏） | ❌ | 浏览器没有 socket API，需本地客户端或 EasyTier 组网互补 |
 | 地址栏直达 | ⚠️ | 页面内 fetch 已透明；**地址栏需要真实通配域名 + 引导页** |
 | **无人值守的长时间传输** | ❌ | 隧道活在页面里，页面被冻结就断——中继方案更合适 |
+
+逐项证据（每一条是怎么测出来的、以及改不动的原因）见 **[docs/CAPABILITIES.md](docs/CAPABILITIES.md)**。
 
 ### ⚠️ 最重要的边界：它是「会话型」传输，不是「任务型」
 
