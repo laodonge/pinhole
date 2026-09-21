@@ -887,7 +887,7 @@ never asserted** — the day the platform fixes it, that number goes from 0 to 1
 
 | | Why it cannot work |
 |---|---|
-| **An app's own Service Worker** | the browser fetches a worker script **past every service worker** (or it would be self-referential), so the request lands on the static host and always 404s. No PWA offline, no push, no background sync. **The side effect is good**: the tunnel cannot be displaced by the app |
+| **An app registering its own Service Worker** | the browser fetches a worker script **past every service worker** (or it would be self-referential), so the request lands on the static host and always 404s. **The side effect is good**: the tunnel cannot be displaced by the app. ⚠️ But this rules out *registration*, **not the capability** — offline / push / background sync only need "a SW with the right event listeners installed", which pinhole's SW could install; what is missing is the policy layer. Do not read "the app cannot register one" as "these cannot work" (see the [capability matrix](CAPABILITIES.en.md)) |
 | **A single-file build** | a worker script must be fetched over http(s) from its **own origin**; `blob:` is rejected (`The URL protocol of the script is not supported`). The floor is two files: `index.html` + `sw.js` |
 
 > **The lesson, worth more than the four bugs**: **"it should work like this" is not evidence; "what

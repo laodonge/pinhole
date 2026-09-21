@@ -466,7 +466,8 @@ npm run test:mqtt --workspace @pinhole/component
 | **Web Worker 脚本** | ✅ | Worker 脚本抓取**会**经过 SW——和 Service Worker 脚本刚好相反（实测） |
 | **拒绝被 frame 的站点** | ✅ | `X-Frame-Options` 与 CSP `frame-ancestors` 会被剥掉；不剥的话外壳的 iframe 一片空白，且看起来和「隧道断了」一模一样 |
 | **取消下载** | ⚠️ | 响应头到达**之后**的取消会传到目标（连接真的关掉）；**到达之前不能**，浏览器不上报 |
-| **应用自带的 Service Worker** | ❌ | 浏览器抓 SW 脚本时绕过所有 SW，登记必然拿到 404——PWA 离线、推送、后台同步都用不了 |
+| **应用注册自己的 Service Worker** | ❌ | 浏览器抓 SW 脚本时绕过所有 SW，登记必然拿到 404；一个 scope 也只能有一个注册。**副作用是好的**：隧道不可能被应用顶掉 |
+| **需要 SW 事件的能力**（离线 / 推送 / 后台同步） | ⚠️ | 应用**没法自己提供**，但**不是做不到**：只能由 pinhole 的 SW 代劳，于是策略归 pinhole。应用仍可用 `caches` / IndexedDB 自己管缓存（[三层拆解](docs/CAPABILITIES.md)） |
 | **上传大文件** | ⚠️ | 请求体会先在 SW 里整个缓冲，内存开销 ≈ 文件大小 |
 | 任意原生 TCP（SSH 客户端、游戏） | ❌ | 浏览器没有 socket API，需本地客户端或 EasyTier 组网互补 |
 | 地址栏直达 | ⚠️ | 页面内 fetch 已透明；**地址栏需要真实通配域名 + 引导页** |

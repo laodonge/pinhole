@@ -67,12 +67,13 @@ See "Verifying it yourself" at the end.
 | HTTP version | One TCP connection per request, `Connection: close`, HTTP/1.1. A target that only speaks h2 will not work |
 | Third-party `Set-Cookie` | The browser **never stores** a `Set-Cookie` on a Service-Worker-synthesised response — the reason the jar exists at all |
 | Cross-origin absolute URLs | A different hostname is a different origin, the SW never sees it, and it is **allowed to go direct by design** |
+| **Capabilities that need SW events** (offline, push, background sync) | An app **cannot provide them itself**, but they are **not impossible** — only pinhole's SW can act on its behalf, which makes the policy pinhole's. See "SW in three layers" below |
 
 ### ❌ Impossible
 
 | Capability | Why the platform forbids it |
 |---|---|
-| **An app's own Service Worker** | The browser fetches a worker script **past every service worker**, so the request lands on the static host and always 404s. No PWA offline, no push, no background sync, no cache-first strategy. **The side effect is good**: the tunnel cannot be displaced |
+| **An app registering its own Service Worker** | The browser fetches a worker script **past every service worker**, so the request lands on the static host and always 404s; and a scope can only hold one registration, which `/` already is. **The side effect is good**: the tunnel cannot be displaced. ⚠️ This rules out *registration*, **not the capability** — see "SW in three layers" below |
 | **A single-file build** (one HTML holding everything) | A worker script must be fetched over http(s) from its **own origin**; `blob:` is rejected (`The URL protocol of the script is not supported`). The floor is therefore **two files**: `index.html` + `sw.js` |
 | Arbitrary native TCP (SSH, games, database protocols) | Browsers have no socket API. This project carries HTTP byte streams, not generic TCP |
 | WebRTC media (video calls), WebTransport | Both are UDP, outside the semantics of a TCP pipe |
@@ -132,6 +133,31 @@ The two rules are opposites, and worth remembering:
 |---|:---:|---|
 | `new Worker("/app-worker.js")` | ✅ Yes | It belongs to a document that is **already controlled** |
 | `navigator.serviceWorker.register("/app-sw.js")` | ❌ No | A worker script fetch is specified to bypass every service worker, or it would be self-referential |
+
+### ❌⚠️ SW in three layers: usable, registrable, and who supplies the capability
+
+Reading "anything SW-related is off the table" as the conclusion misses half of it. Three layers have to be kept apart:
+
+| Layer | Conclusion |
+|---|---|
+| ① pinhole's SW | ✅ **This is the product itself.** Every normal request path in a proxied page is still its job: `fetch` / XHR / `<script>` / `<img>` / `<link>` / nested iframes / navigations / **worker scripts** |
+| ② An app registering **its own** SW | ❌ The platform forbids it (the script cannot be fetched, and a scope holds one registration) |
+| ③ **Capabilities that need SW events** (offline, push, background sync) | ⚠️ **Missing feature, not impossible** — an app cannot provide them, so only pinhole's SW can act on its behalf |
+
+③ is "could be built, is not built" because pinhole's SW is a **real SW**: installing `push` / `sync` listeners and caching by policy are things it can do.
+
+**But one distinction has to be stated precisely: this is not "proxying the app's sw".** The app's `sw.js` is **never fetched, never registered, never run**. Pinhole's SW takes over those roles, and the difference is **whose policy it is**:
+
+| Shape | Who decides what is cached and when a sync runs |
+|---|---|
+| "Proxy the app's SW" (hypothetical) | the app's `sw.js`, with pinhole as a courier |
+| **What can actually be built** | pinhole's SW |
+
+So an app can rely on **whether the capability exists**, never on **who implements it**: `navigator.serviceWorker.controller.scriptURL` is always `/sw.js`, never its own.
+
+**What works today with no new code**: an app can manage its own cache through `caches` / IndexedDB — pure storage APIs, called from the page, with no SW fetch interception involved. What is lost is *transparent* offline interception, not offline itself.
+
+**The better version**, if it is ever built, is for pinhole's SW to expose a protocol: an app declares its caching / sync rules by `postMessage` or config, and pinhole executes them. The mechanism is pinhole's; the policy becomes declarable. That is a design choice, not a platform capability.
 
 ### ✅ Framing refusals have to be stripped
 

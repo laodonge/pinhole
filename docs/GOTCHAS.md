@@ -874,7 +874,7 @@ if it only speaks TLS, restart the agent with `-target-tls insecure`
 
 | | 为什么不可能 |
 |---|---|
-| **应用自带的 Service Worker** | 浏览器抓 SW 脚本时**绕过所有 SW**（否则自我引用），请求落到静态托管上必然 404。PWA 离线、推送、后台同步全都用不了。**副作用是好的**：隧道不可能被应用顶掉 |
+| **应用注册自己的 Service Worker** | 浏览器抓 SW 脚本时**绕过所有 SW**（否则自我引用），请求落到静态托管上必然 404。**副作用是好的**：隧道不可能被应用顶掉。⚠️ 但这只否定「注册」，**不否定「能力」**——离线 / 推送 / 后台同步需要的只是"有个 SW 装对应的事件监听器"，pinhole 的 SW 就能装，缺的是那块策略层。别把「应用注册不了」读成「这些能力做不到」（详见 [能力矩阵](CAPABILITIES.md)） |
 | **单文件自举** | SW 脚本必须由 http(s) 从**自己的源**取；`blob:` 被拒绝（`The URL protocol of the script is not supported`）。所以下限是两个文件：`index.html` + `sw.js` |
 
 > **教训（这一条比上面四个都值钱）**：**"它应该是这样"不是证据，"目标收到了什么"才是。**
