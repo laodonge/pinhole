@@ -13,6 +13,24 @@ interface ProxyRequest {
   body: ArrayBuffer;
 }
 
+/**
+ * How to stop an in-flight proxy request.
+ *
+ * Deliberately mutable, and re-pointed as the request moves through its stages:
+ * at any moment exactly one of these is the end whose cancellation propagates
+ * back to the data channel. Aiming at the wrong one fails quietly — the raw
+ * stream `request()` returns is locked by `splitResponse` for the rest of the
+ * request's life, so cancelling it throws and the target never hears a thing.
+ */
+interface Inflight {
+  /** Set once the browser has abandoned this request. */
+  cancelled: boolean;
+  /** The live drain, once `pump` owns it. Preferred — a locked stream cannot be cancelled. */
+  reader?: ReadableStreamDefaultReader<Uint8Array>;
+  /** The body stream in the window before `pump` takes it over. */
+  stream?: ReadableStream<Uint8Array>;
+}
+
 /** Messages the injected shim sends over its port. */
 type ShimMessage =
   | {
@@ -410,13 +428,75 @@ export class PinholeTunnelElement extends HTMLElement {
   }
 
   private onSwMessage = (event: MessageEvent): void => {
-    const msg = event.data as ProxyRequest | { type: "config-ack" };
+    const msg = event.data as
+      | ProxyRequest
+      | { type: "config-ack" }
+      | { type: "proxy-cancel"; id: string };
     if (msg?.type === "proxy-request") {
       void this.handleProxyRequest(msg);
+    } else if (msg?.type === "proxy-cancel") {
+      this.cancelProxyRequest(msg.id);
     } else if (msg?.type === "config-ack") {
       this.configAck?.();
     }
   };
+
+  /**
+   * Stop working on a request the browser has abandoned.
+   *
+   * Cancelling the drain closes the data channel, and closing the channel closes
+   * the agent's TCP connection to the target — so a cancelled download stops
+   * costing the uplink at once, instead of the target producing bytes into a
+   * socket the page stopped reading.
+   *
+   * Not an exotic path: every `AbortController.abort()`, every navigation away
+   * from a streaming response, and every unload with a download in flight ends
+   * up here.
+   *
+   * Which stream to cancel matters, and getting it wrong fails silently. The
+   * stream `request()` returns is handed to `splitResponse`, which locks it with
+   * a reader for the rest of the request's life — cancelling *that* one throws
+   * `Cannot cancel a locked stream`, so the target never hears anything. The
+   * cancel has to be aimed at whichever stream is currently being drained, which
+   * is why the hook is re-pointed at each stage (see stage).
+   */
+  private cancelProxyRequest(id: string): void {
+    const entry = this.inflight.get(id);
+    // No entry means this request already finished, or was never this
+    // component's. There is nothing to stop, and remembering the id would only
+    // leak a string per stray message.
+    if (!entry) return;
+    entry.cancelled = true;
+    void this.stopInflight(entry);
+  }
+
+  /**
+   * Aim the cancel hook at the stream now being drained.
+   *
+   * Returns true when the request was already abandoned, so the caller must stop
+   * immediately: the stream it just handed over has been cancelled.
+   */
+  private stage(inflight: Inflight, stream: ReadableStream<Uint8Array>): boolean {
+    inflight.stream = stream;
+    inflight.reader = undefined;
+    if (!inflight.cancelled) return false;
+    void this.stopInflight(inflight);
+    return true;
+  }
+
+  /** Cancel whichever part of the chain is live. Idempotent and never throws. */
+  private async stopInflight(entry: Inflight): Promise<void> {
+    try {
+      if (entry.reader) await entry.reader.cancel();
+      else if (entry.stream) await entry.stream.cancel();
+    } catch {
+      // Already closed, already cancelled, or already errored: there is nothing
+      // left to stop, and the caller is gone anyway.
+    }
+  }
+
+  /** In-flight proxy requests, by id, with whatever stops each one. */
+  private inflight = new Map<string, Inflight>();
 
   private async handleProxyRequest(msg: ProxyRequest): Promise<void> {
     const { id, method, url, headers } = msg;
@@ -441,9 +521,20 @@ export class PinholeTunnelElement extends HTMLElement {
       if (merged) headers["cookie"] = merged;
     }
 
+    // Registered before the first await, so a cancel can never arrive for a
+    // request the component has not started tracking: the worker posts
+    // `proxy-request` first and messages from one source arrive in order.
+    const inflight: Inflight = { cancelled: false };
+    this.inflight.set(id, inflight);
+
     try {
       const reqBytes = encodeRequest(method, url, headers, body, this.upstreamHost);
       const stream = await this.tunnel!.request(reqBytes);
+
+      // Cancelled while connecting? This stream is still unlocked, so cancelling
+      // it is the whole cleanup.
+      if (this.stage(inflight, stream)) return;
+
       const { meta, body: bodyStream } = await splitResponse(stream);
 
       // Fold in anything the target just set, before the next request goes out.
@@ -480,9 +571,15 @@ export class PinholeTunnelElement extends HTMLElement {
         statusText: meta.statusText,
         headers: outHeaders,
       });
-      await this.pump(id, outBody);
+      // The body may be wrapped by dechunk/decodeContent by now, and cancelling
+      // the outermost stream is what propagates back down to the data channel.
+      if (this.stage(inflight, outBody)) return;
+      await this.pump(id, outBody, inflight);
     } catch (e) {
       this.postToSw({ type: "proxy-error", id, message: String(e) });
+    } finally {
+      // Finished, failed or cancelled — either way there is nothing left to stop.
+      this.inflight.delete(id);
     }
   }
 
@@ -611,8 +708,23 @@ export class PinholeTunnelElement extends HTMLElement {
     }
   }
 
-  private async pump(id: string, stream: ReadableStream<Uint8Array>): Promise<void> {
+  private async pump(
+    id: string,
+    stream: ReadableStream<Uint8Array>,
+    inflight: Inflight,
+  ): Promise<void> {
     const reader = stream.getReader();
+    // From here the reader is the live end of the chain: a locked stream cannot
+    // be cancelled, but its reader can, and cancelling the reader propagates
+    // back to the data channel.
+    inflight.reader = reader;
+    inflight.stream = undefined;
+    if (inflight.cancelled) {
+      // The cancel landed after the last stage check; nothing has been sent yet.
+      await this.stopInflight(inflight);
+      reader.releaseLock();
+      return;
+    }
     try {
       while (true) {
         const { done, value } = await reader.read();

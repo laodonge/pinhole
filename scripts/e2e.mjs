@@ -60,6 +60,10 @@ const stats = {
   reports: [],
   upgradesSeen: 0,
   probes: [],
+  slowStarted: 0,
+  slowAborted: 0,
+  dribbleStarted: 0,
+  dribbleAborted: 0,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -258,6 +262,146 @@ async function httpApi(req, res, url) {
       res.end("self.addEventListener('install', () => self.skipWaiting());\n");
       return;
     }
+
+    // A *worker* script, for the question a service worker registration only
+    // raises by analogy: worker scripts are fetched by the browser too, but
+    // unlike a service worker script a dedicated worker belongs to a document
+    // that is already controlled. Whether it goes through the worker is an
+    // empirical question, so it gets an endpoint.
+    case "/app-worker.js": {
+      res.writeHead(200, { "content-type": "text/javascript" });
+      res.end("postMessage('worker-ok');\n");
+      return;
+    }
+
+    // Everything the target actually received, verbatim. The browser strips
+    // forbidden header names from anything the worker can observe and the worker
+    // *rebuilds* the request out of what is left, so which headers survive the
+    // hop cannot be read off the source — it has to be measured.
+    case "/api/http/headers": {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(req.headers));
+      return;
+    }
+
+    // A page that refuses to be framed. The shell renders the service inside an
+    // iframe, so this is not an edge case: it is the shape of every app that
+    // ships `X-Frame-Options: DENY`, which is most self-hosted panels.
+    case "/api/http/xfo": {
+      res.writeHead(200, {
+        "content-type": "text/html; charset=utf-8",
+        "x-frame-options": "DENY",
+      });
+      res.end("<!doctype html><title>xfo</title><p id=\"framemark\">framed-ok</p>");
+      return;
+    }
+
+    // The same refusal expressed the modern way. `frame-ancestors` is a CSP
+    // directive, so stripping it means rewriting a header rather than deleting
+    // one — and it is the directive that actually binds in current browsers.
+    case "/api/http/csp-frame": {
+      res.writeHead(200, {
+        "content-type": "text/html; charset=utf-8",
+        "content-security-policy": "frame-ancestors 'none'; default-src 'self' 'unsafe-inline'",
+      });
+      res.end("<!doctype html><title>csp-frame</title><p id=\"framemark\">framed-ok</p>");
+      return;
+    }
+
+    // A response that never sets Content-Length and stays open across several
+    // events: the shape EventSource needs, and the one a proxy that buffers
+    // whole responses breaks by design.
+    case "/api/http/sse": {
+      res.writeHead(200, {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+      });
+      let n = 0;
+      const tick = () => {
+        if (n >= 3) {
+          res.end();
+          return;
+        }
+        res.write(`data: part${++n}\n\n`);
+        setTimeout(tick, 30);
+      };
+      tick();
+      return;
+    }
+
+    // A download the way a browser expects one: the header has to reach the
+    // page intact for an anchor click to turn into a file save.
+    case "/api/http/download": {
+      const payload = Buffer.from("pinhole-download-body");
+      res.writeHead(200, {
+        "content-type": "application/octet-stream",
+        "content-length": String(payload.length),
+        "content-disposition": 'attachment; filename="pinhole-test.bin"',
+      });
+      res.end(payload);
+      return;
+    }
+
+    // A response that deliberately takes its time, so the page can start it and
+    // then walk away. The target's own view of "the caller gave up" is the socket
+    // closing before the body was written.
+    case "/api/http/slow": {
+      stats.slowStarted++;
+      let finished = false;
+      const timer = setTimeout(() => {
+        finished = true;
+        res.writeHead(200, { "content-type": "text/plain" });
+        res.end("slow-done");
+      }, 8000);
+      res.on("close", () => {
+        clearTimeout(timer);
+        if (!finished) stats.slowAborted++;
+      });
+      return;
+    }
+
+    case "/api/http/slow-stats": {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ started: stats.slowStarted, aborted: stats.slowAborted }));
+      return;
+    }
+
+    // Head immediately, body slowly — a large download in progress. This is the
+    // shape a cancel has to reach, because it is the one where the target is
+    // actively burning uplink for a page that stopped listening.
+    case "/api/http/dribble": {
+      stats.dribbleStarted++;
+      let finished = false;
+      res.writeHead(200, { "content-type": "application/octet-stream" });
+      let n = 0;
+      const timer = setInterval(() => {
+        if (n++ >= 80) {
+          finished = true;
+          clearInterval(timer);
+          res.end();
+          return;
+        }
+        res.write(Buffer.alloc(2048, 65));
+      }, 250);
+      res.on("close", () => {
+        clearInterval(timer);
+        if (!finished) stats.dribbleAborted++;
+      });
+      return;
+    }
+
+    case "/api/http/cancel-stats": {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          slowStarted: stats.slowStarted,
+          slowAborted: stats.slowAborted,
+          dribbleStarted: stats.dribbleStarted,
+          dribbleAborted: stats.dribbleAborted,
+        }),
+      );
+      return;
+    }
   }
 
   // The 1Panel terminal mock: dual-purpose HTTP + WS endpoint.
@@ -354,9 +498,16 @@ function handleUpgrade(req, socket, head) {
         ws.send(text);
       }
     });
+    // The close fires on the *connection's* second pong, not the process's.
+    // Keyed globally this only ever worked once: on a second run the counter had
+    // already passed 2, so the close was never sent and the page sat there until
+    // its 15s timeout reported "still open" — a harness bug wearing the costume
+    // of a websocket bug.
+    let pongs = 0;
     ws.on("pong", () => {
       stats.pongs++;
-      if (stats.pongs === 2 && !stats.closeSent) {
+      pongs++;
+      if (pongs === 2) {
         stats.closeSent = { code: 4410, reason: "revalidate" };
         ws.close(4410, "revalidate");
       }
@@ -438,6 +589,40 @@ async function fetchT(path, init, ms) {
 async function text(path) {
   const r = await fetchT(path);
   return { status: r.status, headers: r.headers, body: await r.text() };
+}
+
+// Does a document that refuses to be framed still render inside the shell?
+//
+// The shell puts every proxied service in an iframe, so a target sending
+// X-Frame-Options or frame-ancestors is asking for the one thing this design
+// cannot otherwise give it. A blocked frame still fires its load event and
+// still has a document, so the marker element is what separates "rendered" from
+// "refused".
+async function frameProbe(path, ms) {
+  return await new Promise(function (resolve) {
+    const f = document.createElement("iframe");
+    let settled = false;
+    const done = function (v) {
+      if (settled) return;
+      settled = true;
+      f.remove();
+      resolve(v);
+    };
+    f.addEventListener("load", function () {
+      setTimeout(function () {
+        try {
+          const d = f.contentDocument;
+          done(d && d.getElementById("framemark") ? "framed" : "blocked");
+        } catch (e) {
+          done("blocked");
+        }
+      }, 150);
+    });
+    f.addEventListener("error", function () { done("error"); });
+    f.src = path;
+    document.body.appendChild(f);
+    setTimeout(function () { done("timeout"); }, ms || 8000);
+  });
 }
 
 async function httpChecks() {
@@ -593,6 +778,143 @@ async function httpChecks() {
   } catch (e) {
     eq("a SW cannot be registered from a blob URL", /protocol/i.test(String(e)), true);
   }
+
+  // 15. What the target actually receives. Not a conformance check — the
+  // evidence behind several claims in the docs. The browser hides forbidden
+  // header names from the worker and the worker rebuilds the request from what
+  // is left, so this list is the only honest answer to "what crossed the hop".
+  try {
+    const r = await fetchT("/api/http/headers");
+    const seen = await r.json();
+    log("headers at the target (GET): " + JSON.stringify(seen));
+    // A POST carries headers a GET does not, and those are the ones CSRF
+    // middleware looks at — so it gets its own dump rather than an inference.
+    const p = await fetchT("/api/http/headers", {
+      method: "POST",
+      body: "x=1",
+      headers: { "content-type": "text/plain" },
+    });
+    log("headers at the target (POST): " + JSON.stringify(await p.json()));
+  } catch (e) { log("FAIL headers: " + e); }
+
+  // 16. Framing. Every proxied service is rendered inside an iframe, so a target
+  // that refuses to be framed is one this design cannot show — unless the proxy
+  // strips the refusal on the way through, which is what these two assert.
+  //
+  // Retried on a timeout, because a frame navigation is a fresh TCP connection
+  // to the target and under a full suite one occasionally takes longer than the
+  // budget; a "blocked" answer is never retried, since that is a result and not
+  // a delay.
+  async function frameCheck(name, path) {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const seen = await frameProbe(path, 15000);
+      if (seen !== "timeout") {
+        eq(name, seen, "framed");
+        return;
+      }
+      log("frame probe timed out: " + path + " (attempt " + attempt + ")");
+    }
+    eq(name, "timeout", "framed");
+  }
+  await frameCheck("X-Frame-Options: DENY page still renders", "/api/http/xfo");
+  await frameCheck("frame-ancestors 'none' page still renders", "/api/http/csp-frame");
+
+  // 17. Worker scripts. A service worker script bypasses the worker (check 13);
+  // a dedicated worker script belongs to a document that is already controlled,
+  // which is a *different* rule. Whether it is intercepted is an empirical
+  // question, so it is asked rather than assumed — plenty of apps put their real
+  // logic in a worker.
+  try {
+    const reply = await new Promise(function (resolve) {
+      let done = false;
+      const finish = function (v) {
+        if (done) return;
+        done = true;
+        resolve(v);
+      };
+      const w = new Worker("/app-worker.js");
+      w.onmessage = function (e) { finish("ok:" + e.data); w.terminate(); };
+      w.onerror = function () { finish("error"); w.terminate(); };
+      setTimeout(function () { finish("timeout"); }, 5000);
+    });
+    eq("a worker script is fetched through the tunnel", reply, "ok:worker-ok");
+  } catch (e) { log("FAIL worker: " + e); }
+
+  // 18. EventSource. A streaming response with no Content-Length at all, read by
+  // an API that has to see events as they arrive — the shape a proxy that
+  // buffers whole responses breaks by construction. Several self-hosted panels
+  // (logs, task progress, notifications) are built on it.
+  try {
+    const parts = await new Promise(function (resolve) {
+      const es = new EventSource("/api/http/sse");
+      const got = [];
+      let done = false;
+      const finish = function () {
+        if (done) return;
+        done = true;
+        es.close();
+        resolve(got.join(","));
+      };
+      es.onmessage = function (e) { got.push(e.data); };
+      es.onerror = function () { finish(); };
+      setTimeout(finish, 6000);
+    });
+    eq("EventSource receives every event", parts, "part1,part2,part3");
+  } catch (e) { log("FAIL sse: " + e); }
+
+  // 19. A download. Asserted at the header rather than by saving a file: what
+  // turns a navigation into a save is the disposition header surviving, and the
+  // navigation path is already covered above.
+  try {
+    const r = await fetchT("/api/http/download");
+    const b = await r.text();
+    eq("download disposition survives", r.headers.get("content-disposition"), 'attachment; filename="pinhole-test.bin"');
+    eq("download body arrives", b, "pinhole-download-body");
+  } catch (e) { log("FAIL download: " + e); }
+
+  // 20. Cancellation, which has two halves and they behave differently.
+  //
+  // (a) Abort *before* the response head arrives. The request signal on a fetch
+  // event is the documented way for a worker to hear about this and it did not
+  // fire on Chrome 153 — measured here, repeatedly, with a fresh worker: the
+  // fetch rejects locally and the target never learns. Logged rather than
+  // asserted: it is a platform limit, and if a browser starts honouring the
+  // signal this line flips to 1 on its own, which is the point of printing it.
+  try {
+    const ctrl = new AbortController();
+    const started = fetch("/api/http/slow", { signal: ctrl.signal }).then(
+      function () { return "resolved"; },
+      function (e) { return "rejected:" + e.name; },
+    );
+    setTimeout(function () { ctrl.abort(); }, 500);
+    eq("an aborted fetch rejects locally", await started, "rejected:AbortError");
+    await new Promise(function (r) { setTimeout(r, 2000); });
+    const s1 = await (await fetchT("/api/http/cancel-stats")).json();
+    log("cancel before the head reached the target: " + s1.slowAborted + " of " + s1.slowStarted);
+    // (b) Cancel a download already in progress — the case that matters, since
+    // the target is burning uplink for a page that stopped reading. The hook is
+    // the stream's cancel(), which the browser does call.
+    const ctrl2 = new AbortController();
+    const r2 = await fetchT("/api/http/dribble", { signal: ctrl2.signal });
+    const reader = r2.body.getReader();
+    const draining = (async function () {
+      try {
+        while (true) {
+          const step = await reader.read();
+          if (step.done) break;
+        }
+      } catch (e) {
+        // The abort lands here; that is the expected path.
+      }
+    })();
+    await new Promise(function (r) { setTimeout(r, 1200); });
+    ctrl2.abort();
+    await draining;
+    await new Promise(function (r) { setTimeout(r, 2500); });
+    const s2 = await (await fetchT("/api/http/cancel-stats")).json();
+    log("cancelled downloads reached the target: " + s2.dribbleAborted + " of " + s2.dribbleStarted);
+    eq("cancelling a download reaches the target", s2.dribbleAborted >= 1, true);
+  } catch (e) { log("FAIL abort: " + e); }
 }
 
 async function wsCheck() {

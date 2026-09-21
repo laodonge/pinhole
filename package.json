@@ -11,6 +11,8 @@
   ],
   "scripts": {
     "build": "npm run build --workspaces",
-    "typecheck": "npm run typecheck --workspaces --if-present"
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "check:e2e": "node scripts/check-page-template.mjs",
+    "e2e": "npm run check:e2e && node scripts/e2e.mjs"
   }
 }

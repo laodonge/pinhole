@@ -56,6 +56,8 @@ interface PendingEntry {
   /** Whether the response body should have the websocket shim injected. */
   inject: boolean;
   injector: Injector | null;
+  /** The shell client that owns this request — where a cancel has to be sent. */
+  clientId: string;
 }
 
 /**
@@ -307,6 +309,30 @@ async function tunnelFor(
 
 const pending = new Map<string, PendingEntry>();
 
+/**
+ * The browser has walked away from a request: tell the shell to stop working on it.
+ *
+ * Two hooks feed this, because one of them is not dependable. `request.signal` is
+ * the documented way to learn that the caller aborted, and it did **not** fire in
+ * a measured test on Chrome 153 — an abort 0.6s into a request whose response head
+ * had not arrived yet produced no abort event in the worker at all. The returned
+ * stream's `cancel()`, by contrast, does fire the moment the last reader is gone.
+ *
+ * So both are wired: `cancel()` covers everything from the response head onwards
+ * (which is the case that costs money — a download in progress), and the signal
+ * covers the gap before the head, on browsers that implement it. Whatever the
+ * browser does not tell us stays un-cancelled, which is documented rather than
+ * pretended otherwise.
+ */
+function onAbandoned(id: string): void {
+  const entry = pending.get(id);
+  if (!entry) return;
+  pending.delete(id);
+  void sw.clients.get(entry.clientId).then((client) => {
+    client?.postMessage({ type: "proxy-cancel", id });
+  });
+}
+
 interface CookieStoreLike {
   getAll(options?: { url?: string }): Promise<Array<{ name: string; value: string }>>;
 }
@@ -318,13 +344,20 @@ interface CookieStoreLike {
  * is the one that costs the most here: this worker *reconstructs* the request
  * from those headers, so a cookie-authenticated service sees an anonymous
  * request and answers 401. In practice that means most self-hosted panels —
- * 1Panel, qBittorrent and their like all keep the session in a cookie, usually
- * `HttpOnly`, so `document.cookie` cannot supply it either.
+ * 1Panel, qBittorrent and their like all keep the session in a cookie.
  *
- * `cookieStore` is the API the browser provides for exactly this case. In a
- * service worker global scope it includes `HttpOnly` cookies: they are hidden
- * from *documents* to blunt XSS, not from the worker, which is already
- * origin-trusted code acting for the site.
+ * Measured, and worth stating precisely because the obvious guess is wrong:
+ * what this returns is **only the cookies the browser is willing to expose**.
+ * `HttpOnly` is not among them — the comment that used to stand here claimed the
+ * worker scope lifted that restriction, and a run against a real target showed
+ * the `HttpOnly` cookie set on the shell origin never arriving. So this path
+ * carries the plain cookies, and the ones that actually authenticate a panel
+ * arrive by a different route: the page-side jar, fed from the `Set-Cookie`
+ * headers in the response head this worker parses (see CookieStore in the
+ * component). A session cookie the browser itself stored as `HttpOnly` and that
+ * never crossed the tunnel cannot be recovered here — the only way back is to
+ * log in again through the tunnel, which is what makes the panel's own cookie
+ * visible to the jar.
  */
 async function cookiesFor(url: string): Promise<string> {
   const store = (self as unknown as { cookieStore?: CookieStoreLike }).cookieStore;
@@ -405,6 +438,20 @@ sw.addEventListener("message", (event: ExtendableMessageEvent) => {
       const headers = new Headers();
       for (const [k, v] of msg.headers) headers.append(k, v);
 
+      // The shell frames every proxied service, so a refusal to be framed is a
+      // refusal to be shown at all — see stripFrameAncestors. Done here rather
+      // than in the page because this is the last point where the header still
+      // exists: the browser applies it to the synthesised response just as it
+      // would to a real one.
+      headers.delete("x-frame-options");
+      for (const name of [
+        "content-security-policy",
+        "content-security-policy-report-only",
+      ]) {
+        const csp = headers.get(name);
+        if (csp) headers.set(name, stripFrameAncestors(csp));
+      }
+
       // Rewrite the document only when we can actually read it. A compressed
       // body would have to be inflated first, and injecting into bytes we
       // cannot parse would corrupt the page — worse than not injecting at all.
@@ -440,6 +487,13 @@ sw.addEventListener("message", (event: ExtendableMessageEvent) => {
             }
             controller.close();
           }
+        },
+        // See onAbandoned: this is the dependable half of cancel detection. A
+        // stopped download, an aborted fetch, a navigation away mid-stream and a
+        // page unload all end up here, and without it the target keeps producing
+        // into a socket nobody is reading.
+        cancel() {
+          onAbandoned(msg.id);
         },
       });
       entry.resolve(
@@ -542,6 +596,44 @@ sw.addEventListener("fetch", (event: FetchEvent) => {
   event.respondWith(proxy(event));
 });
 
+/**
+ * Remove `frame-ancestors` from a CSP, keeping every other directive.
+ *
+ * The shell renders every proxied service inside an iframe, so a target that
+ * refuses framing refuses the only way this design can show it. Measured: both
+ * `X-Frame-Options: DENY` and `frame-ancestors 'none'` leave the frame blank,
+ * which is indistinguishable from the tunnel being down — the worst possible
+ * failure mode, because the natural response is to debug the network.
+ *
+ * Only that one directive is dropped. `script-src` and the rest are the app's
+ * own defence, they still work through the proxy, and a transport has no
+ * business discarding them.
+ */
+export function stripFrameAncestors(csp: string): string {
+  return csp
+    .split(";")
+    .map((directive) => directive.trim())
+    .filter((directive) => directive.length > 0 && !/^frame-ancestors(\s|$)/i.test(directive))
+    .join("; ");
+}
+
+/**
+ * An `Accept-Language` header, rebuilt from the browser's own preference list.
+ *
+ * Forbidden to the worker, and its absence is not cosmetic: a server that
+ * negotiates on it serves its default language to every request, so a panel
+ * configured in Chinese answers in English. `navigator.languages` is the same
+ * list the browser would have sent, so reconstructing it is faithful rather
+ * than a guess.
+ */
+export function acceptLanguage(): string {
+  const langs = navigator.languages;
+  if (!langs || langs.length === 0) return navigator.language ?? "";
+  return langs
+    .map((lang, i) => (i === 0 ? lang : `${lang};q=${Math.max(0.1, 1 - i / 10).toFixed(1)}`))
+    .join(",");
+}
+
 async function proxy(event: FetchEvent): Promise<Response> {
   const request = event.request;
   const origin = request.headers.get("origin");
@@ -587,6 +679,45 @@ async function proxy(event: FetchEvent): Promise<Response> {
     if (cookie) headers["cookie"] = cookie;
   }
 
+  // Rebuild the headers the browser refuses to hand to a worker.
+  //
+  // These are forbidden header names: stripped from any header list script can
+  // observe, and this worker *reconstructs* the request from that list, so
+  // whatever is not restored here never crosses the hop. Measured against a real
+  // target, the headers that arrived were host, accept, user-agent, sec-ch-ua*,
+  // accept-encoding and cookie — everything below was simply absent.
+  //
+  // `Sec-Fetch-*` is deliberately *not* reconstructed. It is a signal the
+  // browser computes about how a request was really initiated, and the honest
+  // value would describe the shell rather than the framed app; writing
+  // "same-origin" into it by hand would forge a security signal to satisfy
+  // middleware that is right to ask for one. Servers that enforce it need a
+  // config change, and that is documented rather than papered over.
+  const initiator = event.clientId ? await sw.clients.get(event.clientId) : null;
+
+  if (!headers["referer"] && initiator?.url) {
+    // The document that made the request: the frame that started a navigation,
+    // or the frame a subresource came from — the same rule the browser applies.
+    headers["referer"] = initiator.url;
+  }
+
+  if (
+    !headers["origin"] &&
+    initiator?.url &&
+    request.method !== "GET" &&
+    request.method !== "HEAD"
+  ) {
+    // A same-origin POST carries Origin, and strict CSRF middleware rejects the
+    // request without it. The initiator's origin is right in both deployment
+    // shapes: identical to the site's own origin when the shell *is* the site,
+    // and the page's origin when the page lives somewhere else.
+    headers["origin"] = new URL(initiator.url).origin;
+  }
+
+  if (!headers["accept-language"]) {
+    headers["accept-language"] = acceptLanguage();
+  }
+
   // `Accept-Encoding` is a forbidden header name too, so the browser's own value
   // never reaches us and the origin would never compress anything: every HTML,
   // CSS, JS and JSON response crosses the tunnel at full size. We ask for the
@@ -621,6 +752,7 @@ async function proxy(event: FetchEvent): Promise<Response> {
       origin,
       inject,
       injector: null,
+      clientId: client.id,
     });
   });
 
@@ -631,6 +763,12 @@ async function proxy(event: FetchEvent): Promise<Response> {
     url: request.url,
     headers,
     body,
+  });
+
+  // Tell the shell when the browser gives up on this request — see onAbandoned
+  // for why this is not the only hook and not the reliable one.
+  request.signal.addEventListener("abort", () => {
+    onAbandoned(id);
   });
 
   return response;
