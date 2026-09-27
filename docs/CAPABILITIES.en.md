@@ -67,18 +67,19 @@ See "Verifying it yourself" at the end.
 | HTTP version | One TCP connection per request, `Connection: close`, HTTP/1.1. A target that only speaks h2 will not work |
 | Third-party `Set-Cookie` | The browser **never stores** a `Set-Cookie` on a Service-Worker-synthesised response — the reason the jar exists at all |
 | Cross-origin absolute URLs | A different hostname is a different origin, the SW never sees it, and it is **allowed to go direct by design** |
-| **Capabilities that need SW events** (offline, push, background sync) | An app **cannot provide them itself**, but they are **not impossible** — only pinhole's SW can act on its behalf, which makes the policy pinhole's. See "SW in three layers" below |
+| **"Proactive" capabilities that need SW events** (offline caching, push) | An app **cannot provide them itself**, but they are **not impossible** — only pinhole's SW could act on its behalf, which makes the policy pinhole's. Both are close to worthless for what pinhole serves, though — see below |
 
 ### ❌ Impossible
 
 | Capability | Why the platform forbids it |
 |---|---|
-| **An app registering its own Service Worker** | The browser fetches a worker script **past every service worker**, so the request lands on the static host and always 404s; and a scope can only hold one registration, which `/` already is. **The side effect is good**: the tunnel cannot be displaced. ⚠️ This rules out *registration*, **not the capability** — see "SW in three layers" below |
+| **An app registering its own Service Worker** | The browser fetches a worker script **past every service worker**, so the request lands on the static host and always 404s; and a scope can only hold one registration, which `/` already is. **The side effect is good**: the tunnel cannot be displaced. ⚠️ This rules out *registration*, **not the capability** — see "SW in four layers" below |
 | **A single-file build** (one HTML holding everything) | A worker script must be fetched over http(s) from its **own origin**; `blob:` is rejected (`The URL protocol of the script is not supported`). The floor is therefore **two files**: `index.html` + `sw.js` |
 | Arbitrary native TCP (SSH, games, database protocols) | Browsers have no socket API. This project carries HTTP byte streams, not generic TCP |
 | WebRTC media (video calls), WebTransport | Both are UDP, outside the semantics of a TCP pipe |
 | The remote machine's camera / microphone / USB / serial | Those APIs act on the **local browser**. A page cannot reach the server's hardware |
 | Unattended long transfers | The connection lives in the page and dies with it. A relay (frp / CF Tunnel) is the right tool |
+| **Background sync** | **The same fact as the row above, stated differently**: it asks for "finish the job with the page closed", which needs an executor that holds the tunnel. There is no `RTCPeerConnection` in a SW scope, the tunnel can only live in a page, and a SW is reclaimed after 30–45s idle — all three conditions fail |
 
 ### ❓ Not measured yet
 
@@ -134,17 +135,25 @@ The two rules are opposites, and worth remembering:
 | `new Worker("/app-worker.js")` | ✅ Yes | It belongs to a document that is **already controlled** |
 | `navigator.serviceWorker.register("/app-sw.js")` | ❌ No | A worker script fetch is specified to bypass every service worker, or it would be self-referential |
 
-### ❌⚠️ SW in three layers: usable, registrable, and who supplies the capability
+### ❌⚠️ SW in four layers: usable, registrable, and which capabilities are worth supplying
 
-Reading "anything SW-related is off the table" as the conclusion misses half of it. Three layers have to be kept apart:
+Reading "anything SW-related is off the table" as the conclusion misses half of it. Four layers have to be kept apart:
 
 | Layer | Conclusion |
 |---|---|
 | ① pinhole's SW | ✅ **This is the product itself.** Every normal request path in a proxied page is still its job: `fetch` / XHR / `<script>` / `<img>` / `<link>` / nested iframes / navigations / **worker scripts** |
 | ② An app registering **its own** SW | ❌ The platform forbids it (the script cannot be fetched, and a scope holds one registration) |
-| ③ **Capabilities that need SW events** (offline, push, background sync) | ⚠️ **Missing feature, not impossible** — an app cannot provide them, so only pinhole's SW can act on its behalf |
+| ③ **Offline caching / push** (need SW events) | ⚠️ **Missing feature, not impossible** — an app cannot provide them, so only pinhole's SW could act on its behalf. But both are close to worthless for the apps pinhole serves (see below) |
+| ④ **Background sync** | ❌ **Structurally inapplicable** — it asks for "finish the job with the page closed", which needs an executor holding the tunnel. There is no `RTCPeerConnection` in a SW scope, and a SW is terminated after 30–45s idle. **This is the same fact as "unattended transfers ❌", stated differently** |
 
-③ is "could be built, is not built" because pinhole's SW is a **real SW**: installing `push` / `sync` listeners and caching by policy are things it can do.
+Why ③'s two are "buildable but barely worth building":
+
+| | Why it is worth little to pinhole |
+|---|---|
+| **Offline caching** | The data is on the **far side of the tunnel**. A cached shell plus a dead tunnel does nothing. For the self-hosted panels and netdisks this targets, offline is a false need |
+| **Push** | Technically buildable (`pushManager.subscribe()` works with pinhole's registration; only a `push` listener in the SW is missing). But Web Push must go through the **browser vendor's push service** (FCM / APNs) — for a project whose selling point is P2P, that hands over the notification metadata. And the **agent has better channels**: it is already on your own machine, so email / Bark / Telegram cost one line and need no SW at all |
+
+So "an app cannot have its own SW" costs **very little in practice** — the one scenario that really hurts is putting an **offline-first PWA** behind the tunnel. Then the choices are: accept no offline, move that one app to a relay, or give pinhole's SW a policy protocol (which still is not "the app's SW", only "the app can declare policy").
 
 **But one distinction has to be stated precisely: this is not "proxying the app's sw".** The app's `sw.js` is **never fetched, never registered, never run**. Pinhole's SW takes over those roles, and the difference is **whose policy it is**:
 
